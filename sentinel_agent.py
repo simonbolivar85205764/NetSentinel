@@ -213,8 +213,9 @@ class VirusTotalChecker:
         self._queue    = queue.Queue(maxsize=5000)
         self._seen     = set()
         self._seen_lock = threading.Lock()
-        self._stats    = collections.defaultdict(int)
-        self._enabled  = bool(api_key)
+        self._stats      = collections.defaultdict(int)
+        self._stats_lock = threading.Lock()
+        self._enabled    = bool(api_key)
         self._session  = self._make_session()
 
         if self._enabled:
@@ -254,7 +255,7 @@ class VirusTotalChecker:
 
     @property
     def stats(self):
-        return dict(self._stats)
+        with self._stats_lock: return dict(self._stats)
 
     @property
     def cache_size(self):
@@ -337,18 +338,18 @@ class VirusTotalChecker:
             r = self._session.get(url, timeout=15)
         except requests.exceptions.RequestException as exc:
             log(f"VT network error ({indicator}): {exc}", Fore.YELLOW)
-            self._stats["errors"] += 1
+            with self._stats_lock: self._stats["errors"] += 1
             return None
 
         if r.status_code == 404:
-            self._stats["not_found"] += 1
+            with self._stats_lock: self._stats["not_found"] += 1
             return {"malicious": 0, "suspicious": 0, "harmless": 0,
                     "undetected": 0, "total": 0}
 
         if r.status_code == 429:
             log("VT rate limit hit — sleeping 60 s", Fore.YELLOW)
             time.sleep(60)
-            self._stats["rate_limited"] += 1
+            with self._stats_lock: self._stats["rate_limited"] += 1
             return None
 
         if r.status_code == 401:
@@ -358,7 +359,7 @@ class VirusTotalChecker:
 
         if not r.ok:
             log(f"VT HTTP {r.status_code} for {indicator}", Fore.YELLOW)
-            self._stats["errors"] += 1
+            with self._stats_lock: self._stats["errors"] += 1
             return None
 
         try:
@@ -378,12 +379,12 @@ class VirusTotalChecker:
                 "reputation": attrs.get("reputation", 0),
                 "categories": list(attrs.get("categories", {}).values())[:3],
             }
-            self._stats["hits"] += 1
+            with self._stats_lock: self._stats["hits"] += 1
             return result
 
         except (KeyError, ValueError) as exc:
             log(f"VT parse error ({indicator}): {exc}", Fore.YELLOW)
-            self._stats["errors"] += 1
+            with self._stats_lock: self._stats["errors"] += 1
             return None
 
     def _evaluate(self, indicator, kind, result, context, from_cache=False):
@@ -414,7 +415,7 @@ class VirusTotalChecker:
                 f"{indicator}  —  {meta}",
                 src=indicator,
             )
-            self._stats["alerted_malicious"] += 1
+            with self._stats_lock: self._stats["alerted_malicious"] += 1
 
         elif sus >= VT_SUSPICIOUS_THRESHOLD:
             alerter.fire(
@@ -422,7 +423,7 @@ class VirusTotalChecker:
                 f"{indicator}  —  {meta}",
                 src=indicator,
             )
-            self._stats["alerted_suspicious"] += 1
+            with self._stats_lock: self._stats["alerted_suspicious"] += 1
 
         elif rep < -10:
             # Negative community reputation score (not engine-detected but distrusted)
@@ -431,7 +432,7 @@ class VirusTotalChecker:
                 f"{indicator}  reputation={rep}  —  {meta}",
                 src=indicator,
             )
-            self._stats["alerted_reputation"] += 1
+            with self._stats_lock: self._stats["alerted_reputation"] += 1
 
 
 # Module-level singleton; instantiated in main() after key is resolved
@@ -474,7 +475,7 @@ class AlertShipper(threading.Thread):
         if not s.verify:
             import urllib3
             urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-            log("CA cert not found — TLS verification disabled (dev mode)", Fore.YELLOW)
+            log("WARNING: CA cert not found — TLS verification DISABLED. Distribute certs/ca.crt for production.", Fore.RED)
         s.headers.update({
             "X-API-Key":    self.api_key,
             "X-Agent-ID":   AGENT_ID,
@@ -511,7 +512,8 @@ class AlertShipper(threading.Thread):
         try:
             self.session.post(
                 f"{self.server_url}/api/agent/heartbeat",
-                json={"agent_id": AGENT_ID, "hostname": HOSTNAME},
+                json={"agent_id": AGENT_ID, "hostname": HOSTNAME,
+                      "os": f"Linux {__import__('platform').release()}"},
                 timeout=8,
             )
         except Exception:
@@ -563,6 +565,7 @@ class Alerter:
                 "level": level, "category": category,
                 "message": message, "src": src,
                 "agent_id": AGENT_ID, "hostname": HOSTNAME,
+                "os": f"Linux {__import__('platform').release()}",
             })
         except queue.Full:
             log("Alert queue full — dropping alert", Fore.YELLOW)
@@ -604,6 +607,12 @@ class SlidingCounter:
             while dq and dq[0][0] < cutoff:
                 dq.popleft()
             return {v for _, v in dq}
+
+    def prune_empty(self):
+        with self._lock:
+            empty = [k for k, dq in self._data.items() if not dq]
+            for k in empty:
+                del self._data[k]
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -677,7 +686,8 @@ def detect_arp_spoof(pkt):
     with arp_lock:
         known = arp_table.get(ip)
         if known is None:
-            arp_table[ip] = mac
+            if len(arp_table) < 10000:
+                arp_table[ip] = mac
         elif known != mac:
             alerter.fire("CRITICAL", "ARP SPOOFING",
                 f"IP {ip} MAC changed: {known} -> {mac}  (MITM?)", src=ip)
@@ -784,8 +794,13 @@ def dispatch(pkt):
 # ══════════════════════════════════════════════════════════════════════════════
 
 def stats_reporter(interval=30):
+    _prune_cycle = 0
     while True:
         time.sleep(interval)
+        _prune_cycle += 1
+        if _prune_cycle % 10 == 0:
+            for t in (port_tracker,syn_tracker,icmp_tracker,exfil_tracker,bf_tracker):
+                t.prune_empty()
         with pkt_lock:
             n = pkt_count
         vt_stats = vt.stats if vt else {}
@@ -855,9 +870,12 @@ def main():
     # Load config file
     cfg_path = Path(args.config)
     if cfg_path.exists():
-        user_cfg = json.loads(cfg_path.read_text())
-        CFG.update(user_cfg)
-        print(f"{Fore.GREEN}[v] Config loaded from {cfg_path}{Style.RESET_ALL}")
+        try:
+            user_cfg = json.loads(cfg_path.read_text())
+            CFG.update(user_cfg)
+            print(f"{Fore.GREEN}[v] Config loaded from {cfg_path}{Style.RESET_ALL}")
+        except json.JSONDecodeError as e:
+            sys.exit(f"[!] Config JSON error: {e}")
     else:
         print(f"{Fore.YELLOW}[!] Config not found — using defaults{Style.RESET_ALL}")
 

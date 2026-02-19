@@ -14,10 +14,26 @@ try:
 except ImportError:
     raise SystemExit("[!] pip install flask flask-socketio gevent gevent-websocket")
 
+# ── constants ─────────────────────────────────────────────────────────────────
+MAX_AGENTS        = 500          # SEC-04: cap registered agents
+AGENT_TTL_SEC     = 86400        # SEC-04: prune agents unseen for 24 h
+RATE_LIMIT_WINDOW = 5            # seconds  SEC-03
+RATE_LIMIT_MAX    = 50           # alerts per agent per window  SEC-03
+VALID_LEVELS      = frozenset({"INFO","LOW","MEDIUM","HIGH","CRITICAL"})  # SEC-01
+MAX_FIELD_LEN     = 2048         # SEC-02
+MAX_MSG_LEN       = 4096         # SEC-02
+# ── per-agent rate buckets ─────────────────────────────────────────────────────
+from collections import defaultdict as _dd2
+_rate_buckets = _dd2(lambda: {"count":0,"window_start":0.0})
+_rate_lock = threading.Lock()
+
 def load_config(path):
     p=Path(path)
     if not p.exists(): raise SystemExit(f"[!] Config not found: {path}")
-    return json.loads(p.read_text())
+    try:
+        return json.loads(p.read_text())
+    except json.JSONDecodeError as e:
+        raise SystemExit(f"[!] Config JSON error in {path}: {e}")
 
 MAX_ALERTS=5000; alerts_store=deque(maxlen=MAX_ALERTS); alerts_lock=threading.Lock()
 TBUCKETS=60; timeline=deque([0]*TBUCKETS,maxlen=TBUCKETS); tl_lock=threading.Lock()
@@ -25,7 +41,33 @@ tl_last_min=int(time.time()//60); agents={}; agents_lock=threading.Lock()
 category_counts=defaultdict(int); level_counts=defaultdict(int); src_counts=defaultdict(int)
 
 app=Flask(__name__); app.config["SECRET_KEY"]=uuid.uuid4().hex
-socketio=SocketIO(app,async_mode="gevent",cors_allowed_origins="*",logger=False,engineio_logger=False)
+socketio=SocketIO(app,async_mode="gevent",cors_allowed_origins=[],logger=False,engineio_logger=False)
+
+# ── helpers ───────────────────────────────────────────────────────────────────
+def _trunc(s, n=MAX_FIELD_LEN):
+    return str(s or "")[:n]
+
+def _rate_ok(agent_id):
+    now = time.time()
+    with _rate_lock:
+        b = _rate_buckets[agent_id]
+        if now - b["window_start"] > RATE_LIMIT_WINDOW:
+            b["count"] = 0; b["window_start"] = now
+        b["count"] += 1
+        return b["count"] <= RATE_LIMIT_MAX
+
+def _prune_agents():
+    cutoff = time.time() - AGENT_TTL_SEC
+    with agents_lock:
+        stale = [aid for aid, info in agents.items()
+                 if datetime.fromisoformat(info.get("last_seen","1970-01-01T00:00:00+00:00")).timestamp() < cutoff]
+        for aid in stale:
+            del agents[aid]
+
+def _periodic_prune():
+    while True:
+        time.sleep(3600)
+        _prune_agents()
 
 def require_api_key(f):
     @wraps(f)
@@ -59,35 +101,58 @@ def _agents():
 def _tl():
     with tl_lock: return list(timeline)
 
+@socketio.on("connect")
+def on_connect(auth=None):
+    token = (auth or {}).get("token","") if isinstance(auth,dict) else ""
+    if token != app.config["API_KEY"]:
+        from flask_socketio import disconnect as _dc; _dc(); return False
+
 @app.route("/api/alert",methods=["POST"])
 @require_api_key
 def recv():
     data=request.get_json(silent=True)
     if not data: return jsonify({"error":"Bad request"}),400
     if not {"level","category","message","agent_id","hostname"}.issubset(data): return jsonify({"error":"Missing fields"}),400
-    alert={"id":uuid.uuid4().hex[:12],"ts":datetime.now(timezone.utc).isoformat(),"level":data["level"],
-        "category":data["category"],"message":data["message"],"src":data.get("src",""),
-        "agent_id":data["agent_id"],"hostname":data["hostname"]}
+    # SEC-01: validate level
+    level=str(data.get("level","")).upper()
+    if level not in VALID_LEVELS: return jsonify({"error":"Invalid level"}),422
+    # SEC-02: truncate all string fields
+    agent_id=_trunc(data["agent_id"],64); hostname=_trunc(data["hostname"],253)
+    category=_trunc(data["category"]); message=_trunc(data["message"],MAX_MSG_LEN)
+    src=_trunc(data.get("src","")); os_tag=_trunc(data.get("os",""),128)
+    # SEC-03: rate limit per agent
+    if not _rate_ok(agent_id): return jsonify({"error":"Rate limit exceeded"}),429
+    alert={"id":uuid.uuid4().hex[:12],"ts":datetime.now(timezone.utc).isoformat(),"level":level,
+        "category":category,"message":message,"src":src,"agent_id":agent_id,"hostname":hostname}
     with alerts_lock:
-        alerts_store.appendleft(alert); category_counts[alert["category"]]+=1; level_counts[alert["level"]]+=1
-        if alert["src"]: src_counts[alert["src"]]+=1
+        alerts_store.appendleft(alert); category_counts[category]+=1; level_counts[level]+=1
+        if src: src_counts[src]+=1
     _tick(); ip=request.remote_addr
     with agents_lock:
-        if alert["agent_id"] not in agents:
-            agents[alert["agent_id"]]={"hostname":alert["hostname"],"first_seen":alert["ts"],"alert_count":0,"ip":ip,"os":data.get("os","")}
-        agents[alert["agent_id"]]["last_seen"]=alert["ts"]; agents[alert["agent_id"]]["alert_count"]+=1; agents[alert["agent_id"]]["ip"]=ip
+        if agent_id not in agents:
+            # SEC-04: enforce agent cap
+            if len(agents)>=MAX_AGENTS: return jsonify({"error":"Agent limit reached"}),429
+            agents[agent_id]={"hostname":hostname,"first_seen":alert["ts"],"alert_count":0,"ip":ip,"os":os_tag}
+        agents[agent_id]["last_seen"]=alert["ts"]; agents[agent_id]["alert_count"]+=1; agents[agent_id]["ip"]=ip
+        if os_tag: agents[agent_id]["os"]=os_tag
     socketio.emit("alert",alert); socketio.emit("stats",_stats()); socketio.emit("timeline",_tl())
     return jsonify({"ok":True,"id":alert["id"]}),201
 
 @app.route("/api/agent/heartbeat",methods=["POST"])
 @require_api_key
 def hb():
-    data=request.get_json(silent=True) or {}; aid=data.get("agent_id")
+    data=request.get_json(silent=True) or {}
+    aid=_trunc(data.get("agent_id",""),64)
     if not aid: return jsonify({"error":"Missing agent_id"}),400
+    hostname=_trunc(data.get("hostname","unknown"),253); os_tag=_trunc(data.get("os",""),128)
+    now_iso=datetime.now(timezone.utc).isoformat()
     with agents_lock:
         if aid not in agents:
-            agents[aid]={"hostname":data.get("hostname","unknown"),"first_seen":datetime.now(timezone.utc).isoformat(),"alert_count":0,"ip":request.remote_addr,"os":data.get("os","")}
-        agents[aid]["last_seen"]=datetime.now(timezone.utc).isoformat(); agents[aid]["ip"]=request.remote_addr
+            if len(agents)>=MAX_AGENTS: return jsonify({"ok":True}),200
+            agents[aid]={"hostname":hostname,"first_seen":now_iso,"alert_count":0,"ip":request.remote_addr,"os":os_tag}
+        agents[aid]["last_seen"]=now_iso; agents[aid]["ip"]=request.remote_addr
+        if os_tag: agents[aid]["os"]=os_tag
+        if hostname and hostname!="unknown": agents[aid]["hostname"]=hostname
     socketio.emit("agents",_agents()); return jsonify({"ok":True}),200
 
 @app.route("/api/state",methods=["GET"])
@@ -99,8 +164,10 @@ def state():
 @app.route("/api/alerts/export",methods=["GET"])
 @require_api_key
 def export():
+    # BUG-02 fix: return proper Response so fetch() can handle it with auth headers
+    from flask import Response as _R
     with alerts_lock: data=list(alerts_store)
-    return app.response_class(json.dumps(data,indent=2),mimetype="application/json",
+    return _R(json.dumps(data,indent=2),mimetype="application/json",
         headers={"Content-Disposition":"attachment; filename=netsentinel-alerts.json"})
 
 DASHBOARD_HTML = r"""<!DOCTYPE html>
@@ -140,7 +207,8 @@ header::after{content:'';position:absolute;bottom:-4px;left:0;right:0;height:2px
 .hm span{border-left:1px solid var(--border2);padding-left:16px}
 .hm span:first-child{border:none;padding:0}
 #clock{color:var(--amber);font-size:1.05rem}
-#cst{transition:color .3s}.#cst.live{color:var(--green);text-shadow:var(--gg)}
+#cst{transition:color .3s}
+#cst.live{color:var(--green);text-shadow:var(--gg)}
 @keyframes blink{0%,100%{opacity:1}50%{opacity:0}}
 .bl{animation:blink .9s step-end infinite}
 nav{display:flex;align-items:stretch;border-bottom:1px solid var(--border2);background:var(--bg1);padding:0 18px;gap:2px;}
@@ -381,15 +449,18 @@ nav{display:flex;align-items:stretch;border-bottom:1px solid var(--border2);back
 'use strict';
 let allAlerts=[],activeFilter='ALL',searchStr='',unseen=0,activeTab='o';
 let tlData=new Array(60).fill(0),stats={total:0,by_level:{},by_category:{},top_sources:{}},agData=[];
-const socket=io({secure:true,rejectUnauthorized:false});
-socket.on('connect',()=>{const e=id('cst');e.textContent='● ONLINE';e.style.color='var(--green)';e.style.textShadow='var(--gg)';fetchState();});
-socket.on('disconnect',()=>{const e=id('cst');e.textContent='● OFFLINE';e.style.color='';e.style.textShadow='';});
+/* BUG-01: API key injected by server so browser can authenticate */
+const _SK={{ api_key|tojson }};
+/* BUG-04: pass API key as auth token on WS connect */
+const socket=io({secure:true,rejectUnauthorized:false,auth:{token:_SK}});
+socket.on('connect',()=>{const e=id('cst');e.textContent='● ONLINE';e.classList.add('live');fetchState();});
+socket.on('disconnect',()=>{const e=id('cst');e.textContent='● OFFLINE';e.classList.remove('live');});
 socket.on('alert',a=>{allAlerts.unshift(a);if(allAlerts.length>2000)allAlerts.length=2000;onNew(a);});
 socket.on('stats',s=>{stats=s;rStats();});
 socket.on('timeline',t=>{tlData=t;rTL();rRate();});
 socket.on('agents',ag=>{agData=ag;rAgents();});
 async function fetchState(){
-  try{const r=await fetch('/api/state',{headers:{'X-API-Key':window._SK||''}});
+  try{const r=await fetch('/api/state',{headers:{'X-API-Key':_SK}});
   if(!r.ok)return;const d=await r.json();
   allAlerts=d.alerts||[];stats=d.stats||stats;agData=d.agents||[];tlData=d.timeline||tlData;rAll();}catch(e){}
 }
@@ -405,7 +476,17 @@ document.querySelectorAll('.tab[data-tab]').forEach(b=>{
     if(activeTab==='o'){rTL();rStats();}
   });
 });
-id('expb').addEventListener('click',()=>{window.location.href='/api/alerts/export';});
+id('expb').addEventListener('click',async()=>{
+  try{
+    const r=await fetch('/api/alerts/export',{headers:{'X-API-Key':_SK}});
+    if(!r.ok){console.error('Export failed:',r.status);return;}
+    const blob=await r.blob();
+    const url=URL.createObjectURL(blob);
+    const a=document.createElement('a');a.href=url;a.download='netsentinel-alerts.json';
+    document.body.appendChild(a);a.click();document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+  }catch(e){console.error('Export error:',e);}
+});
 document.querySelectorAll('.fc2').forEach(b=>{
   b.addEventListener('click',()=>{document.querySelectorAll('.fc2').forEach(x=>x.classList.remove('active'));b.classList.add('active');activeFilter=b.dataset.level;rFeed();});
 });
@@ -547,7 +628,8 @@ function ts2(iso){if(!iso)return'—';try{const s=Math.floor((Date.now()-new Dat
 
 @app.route("/")
 def dashboard():
-    return render_template_string(DASHBOARD_HTML)
+    # BUG-01 fix: inject API key so browser JS can call /api/state and /api/alerts/export
+    return render_template_string(DASHBOARD_HTML, api_key=app.config["API_KEY"])
 
 def main():
     parser=argparse.ArgumentParser(description="NetSentinel Server v4")
@@ -560,7 +642,9 @@ def main():
     ssl_ctx.load_cert_chain(cfg["server_cert"],cfg["server_key"])
     ssl_ctx.minimum_version=ssl.TLSVersion.TLSv1_2
     ssl_ctx.set_ciphers("ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256")
-    print(f"\n  NETSENTINEL SERVER v4  |  https://{host}:{port}/  |  TLS 1.2+ ECDHE/AES-GCM\n")
+    # SEC-04: prune stale agents periodically
+    threading.Thread(target=_periodic_prune, daemon=True).start()
+    print(f"\n  NETSENTINEL SERVER v4.1  |  https://{{host}}:{{port}}/  |  TLS 1.2+ ECDHE/AES-GCM\n")
     try:
         import gevent.pywsgi
         from geventwebsocket.handler import WebSocketHandler

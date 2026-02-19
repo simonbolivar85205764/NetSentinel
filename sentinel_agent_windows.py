@@ -165,7 +165,7 @@ class VirusTotalChecker:
     def __init__(self,api_key,rpm=VT_REQUESTS_PER_MINUTE):
         self._key=api_key; self._rate=VTRateLimiter(rpm); self._cache=VTCache()
         self._q=queue.Queue(maxsize=5000); self._seen=set(); self._slk=threading.Lock()
-        self._stats=collections.defaultdict(int); self._en=bool(api_key)
+        self._stats=collections.defaultdict(int); self._stats_lock=threading.Lock(); self._en=bool(api_key)
         self._sess=self._mksess()
         if self._en:
             threading.Thread(target=self._worker,daemon=True,name="VTWorker").start()
@@ -181,7 +181,8 @@ class VirusTotalChecker:
         if not dom or "." not in dom or dom.endswith((".local",".arpa",".internal",".lan")): return
         self._sub(dom,"domain",ctx)
     @property
-    def stats(self): return dict(self._stats)
+    def stats(self):
+        with self._stats_lock: return dict(self._stats)
     @property
     def cache_size(self): return self._cache.size()
     def _sub(self,ind,kind,ctx):
@@ -257,7 +258,7 @@ class AlertShipper(threading.Thread):
         s.verify=ca if Path(ca).exists() else False
         if not s.verify:
             import urllib3; urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-            log("CA cert not found - TLS verification disabled",Fore.YELLOW)
+            log("WARNING: CA cert not found - TLS verification DISABLED. Distribute certs/ca.crt for production.",Fore.RED)
         s.headers.update({"X-API-Key":self.key,"X-Agent-ID":AGENT_ID,"X-Hostname":HOSTNAME,"Content-Type":"application/json","User-Agent":"NetSentinel-WinAgent/3.0"})
         s.mount("https://",HTTPAdapter(max_retries=Retry(total=5,backoff_factor=1.5,status_forcelist=[500,502,503,504],allowed_methods=["POST"])))
         return s
@@ -318,6 +319,10 @@ class SlidingCounter:
             dq=self._d[k]
             while dq and dq[0][0]<c: dq.popleft()
             return {v for _,v in dq}
+    def prune_empty(self):
+        with self._lk:
+            empty=[k for k,dq in self._d.items() if not dq]
+            for k in empty: del self._d[k]
 
 CFG=DEFAULT_CFG.copy()
 pt=SlidingCounter(); syt=SlidingCounter(); it=SlidingCounter(); et=SlidingCounter(); bft=SlidingCounter()
@@ -354,7 +359,8 @@ def detect_arp_spoof(pkt):
     ip,mac=a.psrc,a.hwsrc.lower()
     with arp_lock:
         kn=arp_table.get(ip)
-        if kn is None: arp_table[ip]=mac
+        if kn is None:
+            if len(arp_table)<10000: arp_table[ip]=mac
         elif kn!=mac: alerter.fire("CRITICAL","ARP SPOOFING",f"IP {ip} MAC changed: {kn} -> {mac}  (MITM?)",src=ip); arp_table[ip]=mac
 def detect_dns_tunnel(pkt):
     if not(pkt.haslayer(DNS) and pkt.haslayer(DNSQR)): return
@@ -468,8 +474,12 @@ def choose_iface():
         except(ValueError,IndexError): print("Invalid selection.")
 
 def stats_reporter(interval=30):
+    _pc=0
     while not _stop.is_set():
         time.sleep(interval)
+        _pc+=1
+        if _pc%10==0:
+            for t in (pt,syt,it,et,bft): t.prune_empty()
         if _stop.is_set(): break
         with pkt_lock: n=pkt_count
         vs=vt.stats if vt else {}
@@ -483,7 +493,9 @@ def stats_reporter(interval=30):
 def run_monitor(iface="",no_tray=False):
     global alerter,vt
     cfg_p=Path("sentinel_config.json")
-    if cfg_p.exists(): CFG.update(json.loads(cfg_p.read_text())); log(f"Config loaded from {cfg_p}",Fore.GREEN)
+    if cfg_p.exists():
+        try: CFG.update(json.loads(cfg_p.read_text())); log(f"Config loaded from {cfg_p}",Fore.GREEN)
+        except json.JSONDecodeError as e: log(f"Config JSON error: {e}",Fore.RED); sys.exit(1)
     else: log("sentinel_config.json not found - using defaults",Fore.YELLOW)
     host=CFG.get("server_host","127.0.0.1"); port=CFG.get("server_port",8443)
     if host in("0.0.0.0",""): host="127.0.0.1"
@@ -509,8 +521,10 @@ def run_monitor(iface="",no_tray=False):
     print(f"\n{Fore.GREEN}[*] Sniffing on {Style.BRIGHT}{iface}{Style.RESET_ALL} - {'right-click tray icon' if TRAY_OK and not no_tray else 'Ctrl-C'} to stop\n")
     def sniff_t():
         try: sniff(iface=iface,prn=dispatch,store=False,filter="ip or arp",stop_filter=lambda _:_stop.is_set())
-        except Exception as e: log(f"Sniffer error: {e}",Fore.RED)
-    threading.Thread(target=sniff_t,daemon=True).start()
+        except OSError as e:
+            log(f"Sniffer OSError: {e}. Is Npcap installed? See https://npcap.com",Fore.RED); _stop.set()
+        except Exception as e: log(f"Sniffer error: {e}",Fore.RED); _stop.set()
+    sniff_thread=threading.Thread(target=sniff_t,daemon=True); sniff_thread.start()
     if TRAY_OK and not no_tray: build_tray(srv_url)
     else:
         try: _stop.wait()
@@ -532,7 +546,7 @@ def main():
     if any([args.install,args.start,args.stop,args.remove]):
         if not SVC_OK: sys.exit("[!] pip install pywin32")
         if args.install:
-            win32serviceutil.InstallService(SERVICE_NAME,SERVICE_DISPLAY,exeArgs=f'"{sys.executable}" "{os.path.abspath(__file__)}"',description=SERVICE_DESC,startType=win32service.SERVICE_AUTO_START)
+            win32serviceutil.InstallService(NetSentinelService._svc_name_,NetSentinelService._svc_display_name_,exeName=f'"{sys.executable}" "{os.path.abspath(__file__)}"',description=SERVICE_DESC,startType=win32service.SERVICE_AUTO_START)
             print(f"[+] Service installed: {SERVICE_DISPLAY}")
         if args.start: win32serviceutil.StartService(SERVICE_NAME); print("[+] Service started.")
         if args.stop:  win32serviceutil.StopService(SERVICE_NAME);  print("[+] Service stopped.")
