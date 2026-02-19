@@ -1,988 +1,572 @@
 #!/usr/bin/env python3
+"""sentinel_server.py — NetSentinel Central Command Server (v4)
+Multi-tab GUI: Overview / Live Feed / Agents / Analytics | TLS + API-key auth
+pip install flask flask-socketio gevent gevent-websocket cryptography
 """
-sentinel_server.py  —  NetSentinel Central Command Server
-
-Receives encrypted alerts from agents, serves a real-time GUI dashboard.
-
-Dependencies:
-    pip install flask flask-socketio gevent gevent-websocket cryptography
-
-Run:
-    python3 sentinel_server.py [--config sentinel_config.json]
-"""
-
-import argparse
-import json
-import ssl
-import threading
-import time
-import uuid
+import argparse, json, ssl, threading, time, uuid
 from collections import defaultdict, deque
 from datetime import datetime, timezone
 from functools import wraps
 from pathlib import Path
-
 try:
     from flask import Flask, request, jsonify, render_template_string
-    from flask_socketio import SocketIO, emit
+    from flask_socketio import SocketIO
 except ImportError:
-    raise SystemExit("[!] Run:  pip install flask flask-socketio gevent gevent-websocket")
+    raise SystemExit("[!] pip install flask flask-socketio gevent gevent-websocket")
 
-# ══════════════════════════════════════════════════════════════════════════════
-# CONFIG
-# ══════════════════════════════════════════════════════════════════════════════
-
-def load_config(path: str) -> dict:
-    p = Path(path)
-    if not p.exists():
-        raise SystemExit(f"[!] Config not found: {path}  —  run gen_certs.py first.")
+def load_config(path):
+    p=Path(path)
+    if not p.exists(): raise SystemExit(f"[!] Config not found: {path}")
     return json.loads(p.read_text())
 
+MAX_ALERTS=5000; alerts_store=deque(maxlen=MAX_ALERTS); alerts_lock=threading.Lock()
+TBUCKETS=60; timeline=deque([0]*TBUCKETS,maxlen=TBUCKETS); tl_lock=threading.Lock()
+tl_last_min=int(time.time()//60); agents={}; agents_lock=threading.Lock()
+category_counts=defaultdict(int); level_counts=defaultdict(int); src_counts=defaultdict(int)
 
-# ══════════════════════════════════════════════════════════════════════════════
-# STATE
-# ══════════════════════════════════════════════════════════════════════════════
-
-MAX_ALERTS   = 2000   # rolling in-memory buffer
-alerts_store: deque  = deque(maxlen=MAX_ALERTS)
-alerts_lock           = threading.Lock()
-
-agents: dict[str, dict] = {}   # agent_id → {hostname, last_seen, alert_count, ip}
-agents_lock = threading.Lock()
-
-category_counts: dict[str, int] = defaultdict(int)
-level_counts:    dict[str, int] = defaultdict(int)
-level_order = ["INFO", "LOW", "MEDIUM", "HIGH", "CRITICAL"]
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# FLASK APP
-# ══════════════════════════════════════════════════════════════════════════════
-
-app = Flask(__name__)
-app.config["SECRET_KEY"] = uuid.uuid4().hex
-
-socketio = SocketIO(
-    app,
-    async_mode="gevent",
-    cors_allowed_origins="*",
-    logger=False,
-    engineio_logger=False,
-)
-
-
-# ── auth decorator ─────────────────────────────────────────────────────────────
+app=Flask(__name__); app.config["SECRET_KEY"]=uuid.uuid4().hex
+socketio=SocketIO(app,async_mode="gevent",cors_allowed_origins="*",logger=False,engineio_logger=False)
 
 def require_api_key(f):
     @wraps(f)
-    def wrapper(*args, **kwargs):
-        key = request.headers.get("X-API-Key", "")
-        if key != app.config["API_KEY"]:
-            return jsonify({"error": "Unauthorized"}), 401
-        return f(*args, **kwargs)
-    return wrapper
+    def w(*a,**k):
+        if request.headers.get("X-API-Key","")!=app.config["API_KEY"]: return jsonify({"error":"Unauthorized"}),401
+        return f(*a,**k)
+    return w
 
+def _tick():
+    global tl_last_min
+    nm=int(time.time()//60)
+    with tl_lock:
+        for _ in range(min(nm-tl_last_min,TBUCKETS)): timeline.append(0)
+        tl_last_min=nm; timeline[-1]+=1
 
-# ── REST endpoints ─────────────────────────────────────────────────────────────
-
-@app.route("/api/alert", methods=["POST"])
-@require_api_key
-def receive_alert():
-    data = request.get_json(silent=True)
-    if not data:
-        return jsonify({"error": "Bad request"}), 400
-
-    required = {"level", "category", "message", "agent_id", "hostname"}
-    if not required.issubset(data):
-        return jsonify({"error": "Missing fields"}), 400
-
-    alert = {
-        "id":        uuid.uuid4().hex[:12],
-        "ts":        datetime.now(timezone.utc).isoformat(),
-        "level":     data["level"],
-        "category":  data["category"],
-        "message":   data["message"],
-        "src":       data.get("src", ""),
-        "agent_id":  data["agent_id"],
-        "hostname":  data["hostname"],
-    }
-
+def _stats():
     with alerts_lock:
-        alerts_store.appendleft(alert)
-        category_counts[alert["category"]] += 1
-        level_counts[alert["level"]]       += 1
+        return {"total":sum(level_counts.values()),"by_level":dict(level_counts),
+            "by_category":dict(sorted(category_counts.items(),key=lambda x:-x[1])[:20]),
+            "top_sources":dict(sorted(src_counts.items(),key=lambda x:-x[1])[:10])}
 
-    # Update agent registry
-    agent_ip = request.remote_addr
+def _agents():
+    now=time.time(); result=[]
+    with agents_lock:
+        for aid,info in agents.items():
+            try: online=(now-datetime.fromisoformat(info["last_seen"]).timestamp())<90
+            except: online=False
+            result.append({**info,"agent_id":aid,"online":online})
+    result.sort(key=lambda a:a.get("alert_count",0),reverse=True); return result
+
+def _tl():
+    with tl_lock: return list(timeline)
+
+@app.route("/api/alert",methods=["POST"])
+@require_api_key
+def recv():
+    data=request.get_json(silent=True)
+    if not data: return jsonify({"error":"Bad request"}),400
+    if not {"level","category","message","agent_id","hostname"}.issubset(data): return jsonify({"error":"Missing fields"}),400
+    alert={"id":uuid.uuid4().hex[:12],"ts":datetime.now(timezone.utc).isoformat(),"level":data["level"],
+        "category":data["category"],"message":data["message"],"src":data.get("src",""),
+        "agent_id":data["agent_id"],"hostname":data["hostname"]}
+    with alerts_lock:
+        alerts_store.appendleft(alert); category_counts[alert["category"]]+=1; level_counts[alert["level"]]+=1
+        if alert["src"]: src_counts[alert["src"]]+=1
+    _tick(); ip=request.remote_addr
     with agents_lock:
         if alert["agent_id"] not in agents:
-            agents[alert["agent_id"]] = {
-                "hostname":    alert["hostname"],
-                "first_seen":  alert["ts"],
-                "alert_count": 0,
-                "ip":          agent_ip,
-            }
-        agents[alert["agent_id"]]["last_seen"]    = alert["ts"]
-        agents[alert["agent_id"]]["alert_count"] += 1
+            agents[alert["agent_id"]]={"hostname":alert["hostname"],"first_seen":alert["ts"],"alert_count":0,"ip":ip,"os":data.get("os","")}
+        agents[alert["agent_id"]]["last_seen"]=alert["ts"]; agents[alert["agent_id"]]["alert_count"]+=1; agents[alert["agent_id"]]["ip"]=ip
+    socketio.emit("alert",alert); socketio.emit("stats",_stats()); socketio.emit("timeline",_tl())
+    return jsonify({"ok":True,"id":alert["id"]}),201
 
-    # Push to dashboard in real time
-    socketio.emit("alert", alert)
-    socketio.emit("stats", _build_stats())
-
-    return jsonify({"ok": True, "id": alert["id"]}), 201
-
-
-@app.route("/api/agent/heartbeat", methods=["POST"])
+@app.route("/api/agent/heartbeat",methods=["POST"])
 @require_api_key
-def heartbeat():
-    data = request.get_json(silent=True) or {}
-    agent_id = data.get("agent_id")
-    if not agent_id:
-        return jsonify({"error": "Missing agent_id"}), 400
-
+def hb():
+    data=request.get_json(silent=True) or {}; aid=data.get("agent_id")
+    if not aid: return jsonify({"error":"Missing agent_id"}),400
     with agents_lock:
-        if agent_id not in agents:
-            agents[agent_id] = {
-                "hostname":    data.get("hostname", "unknown"),
-                "first_seen":  datetime.now(timezone.utc).isoformat(),
-                "alert_count": 0,
-                "ip":          request.remote_addr,
-            }
-        agents[agent_id]["last_seen"] = datetime.now(timezone.utc).isoformat()
-        agents[agent_id]["ip"]        = request.remote_addr
+        if aid not in agents:
+            agents[aid]={"hostname":data.get("hostname","unknown"),"first_seen":datetime.now(timezone.utc).isoformat(),"alert_count":0,"ip":request.remote_addr,"os":data.get("os","")}
+        agents[aid]["last_seen"]=datetime.now(timezone.utc).isoformat(); agents[aid]["ip"]=request.remote_addr
+    socketio.emit("agents",_agents()); return jsonify({"ok":True}),200
 
-    socketio.emit("agents", _build_agents())
-    return jsonify({"ok": True}), 200
-
-
-@app.route("/api/state", methods=["GET"])
+@app.route("/api/state",methods=["GET"])
 @require_api_key
-def get_state():
-    with alerts_lock:
-        recent = list(alerts_store)[:200]
-    return jsonify({"alerts": recent, "stats": _build_stats(), "agents": _build_agents()})
+def state():
+    with alerts_lock: recent=list(alerts_store)[:500]
+    return jsonify({"alerts":recent,"stats":_stats(),"agents":_agents(),"timeline":_tl()})
 
-
-def _build_stats() -> dict:
-    with alerts_lock:
-        return {
-            "total":      sum(level_counts.values()),
-            "by_level":   dict(level_counts),
-            "by_category": dict(category_counts),
-        }
-
-def _build_agents() -> list:
-    now = time.time()
-    result = []
-    with agents_lock:
-        for aid, info in agents.items():
-            try:
-                last = datetime.fromisoformat(info["last_seen"]).timestamp()
-                online = (now - last) < 90
-            except Exception:
-                online = False
-            result.append({**info, "agent_id": aid, "online": online})
-    return result
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# DASHBOARD  (served as a single-file SPA)
-# ══════════════════════════════════════════════════════════════════════════════
+@app.route("/api/alerts/export",methods=["GET"])
+@require_api_key
+def export():
+    with alerts_lock: data=list(alerts_store)
+    return app.response_class(json.dumps(data,indent=2),mimetype="application/json",
+        headers={"Content-Disposition":"attachment; filename=netsentinel-alerts.json"})
 
 DASHBOARD_HTML = r"""<!DOCTYPE html>
 <html lang="en">
 <head>
-<meta charset="UTF-8"/>
-<meta name="viewport" content="width=device-width,initial-scale=1"/>
-<title>NetSentinel — Command Centre</title>
-<link rel="preconnect" href="https://fonts.googleapis.com"/>
-<link href="https://fonts.googleapis.com/css2?family=Share+Tech+Mono&family=Rajdhani:wght@400;500;600;700&family=Orbitron:wght@700;900&display=swap" rel="stylesheet"/>
+<meta charset="UTF-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>NetSentinel — Command Center</title>
+<link href="https://fonts.googleapis.com/css2?family=VT323&family=Courier+Prime:wght@400;700&family=Bebas+Neue&display=swap" rel="stylesheet"/>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.6.1/socket.io.min.js"></script>
 <style>
-  :root {
-    --bg0:       #03050a;
-    --bg1:       #080d16;
-    --bg2:       #0d1520;
-    --bg3:       #121d2b;
-    --border:    #1a2d45;
-    --accent:    #00d4ff;
-    --accent2:   #00ff9d;
-    --warn:      #ffcc00;
-    --danger:    #ff3c5a;
-    --critical:  #ff00aa;
-    --muted:     #3a5470;
-    --text:      #c8dff0;
-    --textdim:   #5a7a99;
-    --glow:      0 0 12px rgba(0,212,255,.35);
-    --glow2:     0 0 12px rgba(0,255,157,.35);
-    --font-mono: 'Share Tech Mono', monospace;
-    --font-ui:   'Rajdhani', sans-serif;
-    --font-hd:   'Orbitron', sans-serif;
-  }
-
-  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
-
-  body {
-    background: var(--bg0);
-    color: var(--text);
-    font-family: var(--font-ui);
-    font-size: 15px;
-    min-height: 100vh;
-    overflow-x: hidden;
-  }
-
-  /* scanline overlay */
-  body::after {
-    content: '';
-    position: fixed; inset: 0;
-    background: repeating-linear-gradient(
-      0deg,
-      transparent, transparent 2px,
-      rgba(0,0,0,.08) 2px, rgba(0,0,0,.08) 4px
-    );
-    pointer-events: none;
-    z-index: 9999;
-  }
-
-  /* grid noise texture */
-  body::before {
-    content: '';
-    position: fixed; inset: 0;
-    background-image:
-      radial-gradient(ellipse 80% 50% at 10% 0%, rgba(0,100,200,.12) 0%, transparent 70%),
-      radial-gradient(ellipse 60% 40% at 90% 100%, rgba(0,200,120,.07) 0%, transparent 70%);
-    pointer-events: none;
-    z-index: 0;
-  }
-
-  /* ── Header ── */
-  header {
-    position: sticky; top: 0; z-index: 100;
-    background: rgba(3,5,10,.92);
-    backdrop-filter: blur(12px);
-    border-bottom: 1px solid var(--border);
-    display: flex; align-items: center; justify-content: space-between;
-    padding: 0 2rem;
-    height: 60px;
-  }
-
-  .logo {
-    font-family: var(--font-hd);
-    font-size: 1.2rem;
-    font-weight: 900;
-    letter-spacing: .15em;
-    color: var(--accent);
-    text-shadow: var(--glow);
-    display: flex; align-items: center; gap: .75rem;
-  }
-
-  .logo-icon {
-    width: 28px; height: 28px;
-    border: 2px solid var(--accent);
-    border-radius: 4px;
-    display: flex; align-items: center; justify-content: center;
-    font-size: .9rem;
-    box-shadow: var(--glow), inset 0 0 8px rgba(0,212,255,.15);
-    animation: pulse-border 2s ease-in-out infinite;
-  }
-
-  @keyframes pulse-border {
-    0%,100% { box-shadow: var(--glow), inset 0 0 8px rgba(0,212,255,.15); }
-    50%      { box-shadow: 0 0 20px rgba(0,212,255,.6), inset 0 0 12px rgba(0,212,255,.3); }
-  }
-
-  .header-right {
-    display: flex; align-items: center; gap: 1.5rem;
-    font-family: var(--font-mono);
-    font-size: .75rem;
-    color: var(--textdim);
-  }
-
-  #clock { color: var(--accent2); }
-
-  .conn-dot {
-    width: 8px; height: 8px; border-radius: 50%;
-    background: var(--muted);
-    transition: background .3s, box-shadow .3s;
-  }
-  .conn-dot.live {
-    background: var(--accent2);
-    box-shadow: 0 0 8px var(--accent2);
-    animation: blink 1.4s ease-in-out infinite;
-  }
-  @keyframes blink { 0%,100%{opacity:1} 50%{opacity:.4} }
-
-  /* ── Layout ── */
-  main {
-    position: relative; z-index: 1;
-    display: grid;
-    grid-template-columns: 280px 1fr;
-    grid-template-rows: auto 1fr;
-    gap: 1px;
-    height: calc(100vh - 60px);
-    background: var(--border);
-  }
-
-  .sidebar {
-    grid-row: 1 / 3;
-    background: var(--bg1);
-    display: flex; flex-direction: column;
-    overflow-y: auto;
-  }
-
-  .top-bar {
-    background: var(--bg1);
-    padding: 1rem 1.25rem;
-    display: flex; gap: 1rem; flex-wrap: wrap;
-  }
-
-  .feed-panel {
-    background: var(--bg0);
-    overflow-y: auto;
-    display: flex; flex-direction: column;
-  }
-
-  /* ── Stat cards ── */
-  .stat-card {
-    flex: 1; min-width: 120px;
-    background: var(--bg2);
-    border: 1px solid var(--border);
-    border-radius: 6px;
-    padding: .75rem 1rem;
-    position: relative;
-    overflow: hidden;
-  }
-  .stat-card::before {
-    content: '';
-    position: absolute; top: 0; left: 0; right: 0;
-    height: 2px;
-    background: var(--accent);
-  }
-  .stat-card.high::before  { background: var(--danger); }
-  .stat-card.crit::before  { background: var(--critical); }
-  .stat-card.warn::before  { background: var(--warn); }
-
-  .stat-label {
-    font-family: var(--font-mono);
-    font-size: .65rem;
-    letter-spacing: .12em;
-    color: var(--textdim);
-    text-transform: uppercase;
-    margin-bottom: .3rem;
-  }
-  .stat-value {
-    font-family: var(--font-hd);
-    font-size: 1.8rem;
-    font-weight: 700;
-    line-height: 1;
-    color: var(--text);
-  }
-  .stat-card.high  .stat-value { color: var(--danger); }
-  .stat-card.crit  .stat-value { color: var(--critical); }
-
-  /* ── Sidebar sections ── */
-  .sidebar-section {
-    border-bottom: 1px solid var(--border);
-    padding: 1rem 1.25rem;
-  }
-  .sidebar-title {
-    font-family: var(--font-mono);
-    font-size: .65rem;
-    letter-spacing: .15em;
-    color: var(--accent);
-    text-transform: uppercase;
-    margin-bottom: .85rem;
-    display: flex; align-items: center; gap: .5rem;
-  }
-  .sidebar-title::after {
-    content: '';
-    flex: 1;
-    height: 1px;
-    background: var(--border);
-  }
-
-  /* bar chart rows */
-  .bar-row {
-    display: flex; align-items: center; gap: .6rem;
-    margin-bottom: .5rem;
-    font-size: .82rem;
-  }
-  .bar-label {
-    font-family: var(--font-mono);
-    font-size: .72rem;
-    color: var(--textdim);
-    width: 110px;
-    flex-shrink: 0;
-    white-space: nowrap;
-    overflow: hidden;
-    text-overflow: ellipsis;
-  }
-  .bar-track {
-    flex: 1;
-    height: 6px;
-    background: var(--bg3);
-    border-radius: 3px;
-    overflow: hidden;
-  }
-  .bar-fill {
-    height: 100%;
-    border-radius: 3px;
-    background: var(--accent);
-    transition: width .5s ease;
-  }
-  .bar-count {
-    font-family: var(--font-mono);
-    font-size: .7rem;
-    color: var(--text);
-    min-width: 28px;
-    text-align: right;
-  }
-
-  /* level-specific bar colours */
-  .bar-INFO     { background: var(--muted); }
-  .bar-LOW      { background: var(--accent2); }
-  .bar-MEDIUM   { background: var(--warn); }
-  .bar-HIGH     { background: var(--danger); }
-  .bar-CRITICAL { background: var(--critical); }
-
-  /* agent cards */
-  .agent-card {
-    background: var(--bg2);
-    border: 1px solid var(--border);
-    border-radius: 6px;
-    padding: .7rem .9rem;
-    margin-bottom: .6rem;
-    display: flex; align-items: center; gap: .75rem;
-  }
-  .agent-indicator {
-    width: 9px; height: 9px; border-radius: 50%;
-    background: var(--muted); flex-shrink: 0;
-  }
-  .agent-indicator.online {
-    background: var(--accent2);
-    box-shadow: 0 0 7px var(--accent2);
-    animation: blink 2s ease-in-out infinite;
-  }
-  .agent-info { flex: 1; min-width: 0; }
-  .agent-hostname {
-    font-family: var(--font-mono);
-    font-size: .8rem;
-    color: var(--text);
-    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
-  }
-  .agent-meta {
-    font-size: .7rem;
-    color: var(--textdim);
-    margin-top: .15rem;
-  }
-  .agent-count {
-    font-family: var(--font-hd);
-    font-size: .9rem;
-    font-weight: 700;
-    color: var(--accent);
-  }
-
-  /* ── Alert feed ── */
-  .feed-header {
-    position: sticky; top: 0; z-index: 10;
-    background: rgba(3,5,10,.95);
-    backdrop-filter: blur(8px);
-    border-bottom: 1px solid var(--border);
-    padding: .75rem 1.25rem;
-    display: flex; align-items: center; justify-content: space-between;
-  }
-  .feed-title {
-    font-family: var(--font-hd);
-    font-size: .9rem;
-    letter-spacing: .1em;
-    color: var(--accent);
-  }
-  .feed-controls { display: flex; gap: .75rem; align-items: center; }
-
-  .filter-btn {
-    font-family: var(--font-mono);
-    font-size: .68rem;
-    letter-spacing: .08em;
-    padding: .25rem .6rem;
-    border: 1px solid var(--border);
-    border-radius: 3px;
-    background: transparent;
-    color: var(--textdim);
-    cursor: pointer;
-    transition: all .2s;
-  }
-  .filter-btn:hover, .filter-btn.active {
-    border-color: var(--accent);
-    color: var(--accent);
-    background: rgba(0,212,255,.08);
-  }
-  .filter-btn.CRITICAL.active { border-color:var(--critical); color:var(--critical); background:rgba(255,0,170,.08); }
-  .filter-btn.HIGH.active     { border-color:var(--danger);   color:var(--danger);   background:rgba(255,60,90,.08); }
-  .filter-btn.MEDIUM.active   { border-color:var(--warn);     color:var(--warn);     background:rgba(255,204,0,.08); }
-
-  #alert-list {
-    flex: 1;
-    padding: .75rem 1rem;
-    display: flex;
-    flex-direction: column;
-    gap: .45rem;
-  }
-
-  /* alert row */
-  .alert-row {
-    display: grid;
-    grid-template-columns: auto 90px 130px 1fr auto;
-    gap: .6rem;
-    align-items: center;
-    background: var(--bg2);
-    border: 1px solid var(--border);
-    border-left: 3px solid var(--muted);
-    border-radius: 5px;
-    padding: .55rem .85rem;
-    font-size: .82rem;
-    animation: row-in .25s ease;
-    transition: border-color .2s, background .2s;
-  }
-  .alert-row:hover {
-    background: var(--bg3);
-    border-color: var(--accent);
-    border-left-color: inherit;
-  }
-
-  @keyframes row-in {
-    from { opacity:0; transform:translateY(-6px); }
-    to   { opacity:1; transform:translateY(0); }
-  }
-
-  .alert-row.INFO     { border-left-color: var(--muted); }
-  .alert-row.LOW      { border-left-color: var(--accent2); }
-  .alert-row.MEDIUM   { border-left-color: var(--warn); }
-  .alert-row.HIGH     { border-left-color: var(--danger); }
-  .alert-row.CRITICAL { border-left-color: var(--critical); background: rgba(255,0,170,.05); }
-
-  .alert-level {
-    font-family: var(--font-mono);
-    font-size: .65rem;
-    letter-spacing: .08em;
-    padding: .2rem .45rem;
-    border-radius: 3px;
-    font-weight: 700;
-    white-space: nowrap;
-  }
-  .alert-level.INFO     { color: var(--textdim);  background: rgba(58,84,112,.3); }
-  .alert-level.LOW      { color: var(--accent2);  background: rgba(0,255,157,.1); }
-  .alert-level.MEDIUM   { color: var(--warn);     background: rgba(255,204,0,.1); }
-  .alert-level.HIGH     { color: var(--danger);   background: rgba(255,60,90,.12); }
-  .alert-level.CRITICAL { color: var(--critical); background: rgba(255,0,170,.15); }
-
-  .alert-ts {
-    font-family: var(--font-mono);
-    font-size: .7rem;
-    color: var(--textdim);
-    white-space: nowrap;
-  }
-  .alert-category {
-    font-family: var(--font-mono);
-    font-size: .75rem;
-    color: var(--accent);
-    white-space: nowrap;
-  }
-  .alert-message {
-    color: var(--text);
-    font-size: .82rem;
-    white-space: nowrap;
-    overflow: hidden;
-    text-overflow: ellipsis;
-  }
-  .alert-agent {
-    font-family: var(--font-mono);
-    font-size: .65rem;
-    color: var(--textdim);
-    text-align: right;
-    white-space: nowrap;
-  }
-
-  .empty-state {
-    flex: 1;
-    display: flex; flex-direction: column;
-    align-items: center; justify-content: center;
-    gap: 1rem;
-    color: var(--textdim);
-    font-family: var(--font-mono);
-    font-size: .85rem;
-    letter-spacing: .05em;
-    padding: 4rem;
-  }
-  .empty-icon { font-size: 2.5rem; opacity: .3; }
-  .empty-state p { text-align: center; line-height: 1.7; }
-
-  /* scrollbar */
-  ::-webkit-scrollbar { width: 5px; }
-  ::-webkit-scrollbar-track { background: var(--bg0); }
-  ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
-  ::-webkit-scrollbar-thumb:hover { background: var(--muted); }
-
-  /* toasts */
-  #toast-container {
-    position: fixed; bottom: 1.5rem; right: 1.5rem;
-    z-index: 1000;
-    display: flex; flex-direction: column; gap: .5rem;
-    pointer-events: none;
-  }
-  .toast {
-    background: var(--bg2);
-    border: 1px solid var(--border);
-    border-left: 3px solid var(--accent);
-    border-radius: 5px;
-    padding: .6rem 1rem;
-    font-family: var(--font-mono);
-    font-size: .75rem;
-    color: var(--text);
-    max-width: 340px;
-    animation: toast-in .25s ease, toast-out .3s ease 2.7s forwards;
-    pointer-events: none;
-  }
-  .toast.CRITICAL { border-left-color: var(--critical); }
-  .toast.HIGH     { border-left-color: var(--danger); }
-  .toast.MEDIUM   { border-left-color: var(--warn); }
-  @keyframes toast-in  { from{opacity:0;transform:translateX(20px)} to{opacity:1;transform:none} }
-  @keyframes toast-out { from{opacity:1} to{opacity:0;transform:translateX(20px)} }
+:root{
+  --bg:#050800;--bg1:#080d02;--bg2:#0c1204;--bg3:#111a06;
+  --amber:#ffb000;--amber2:#ffd060;--amber-dim:#7a5500;
+  --green:#39ff14;--red:#ff2020;--orange:#ff7700;
+  --border:#1e2e08;--border2:#3d5518;
+  --text:#d4a800;--textdim:#7a6000;--textfaint:#3a2e00;
+  --critical:#ff0055;--high:#ff4400;--medium:#ffaa00;--low:#88cc00;--info:#00aacc;
+  --fm:'Courier Prime','Courier New',monospace;
+  --fh:'Bebas Neue',sans-serif;--fc:'VT323',monospace;
+  --ga:0 0 8px rgba(255,176,0,.5),0 0 20px rgba(255,176,0,.2);
+  --gg:0 0 8px rgba(57,255,20,.4);
+}
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+html,body{height:100%;overflow:hidden}
+body{background:var(--bg);color:var(--text);font-family:var(--fm);font-size:13px;line-height:1.5;
+  background-image:repeating-linear-gradient(0deg,transparent 0,transparent 3px,rgba(0,0,0,.07) 3px,rgba(0,0,0,.07) 4px),
+    radial-gradient(ellipse 70% 60% at 50% 40%,rgba(60,80,0,.1) 0%,transparent 80%);}
+@keyframes flicker{0%,100%{opacity:1}93%{opacity:.96}96%{opacity:.97}}
+body{animation:flicker 8s infinite}
+#app{display:grid;grid-template-rows:52px 40px 1fr;height:100vh;overflow:hidden}
+header{display:flex;align-items:center;justify-content:space-between;padding:0 20px;border-bottom:2px solid var(--border2);background:var(--bg1);position:relative;}
+header::after{content:'';position:absolute;bottom:-4px;left:0;right:0;height:2px;background:linear-gradient(90deg,transparent,var(--amber),transparent);opacity:.4;}
+.logo{font-family:var(--fh);font-size:1.9rem;letter-spacing:.3em;color:var(--amber);text-shadow:var(--ga);display:flex;align-items:center;gap:12px;}
+@keyframes spin-slow{to{transform:rotate(360deg)}}
+.logo-hex{font-size:1.9rem;text-shadow:var(--ga);animation:spin-slow 25s linear infinite}
+.hm{display:flex;align-items:center;gap:18px;font-family:var(--fc);font-size:.95rem;color:var(--textdim)}
+.hm span{border-left:1px solid var(--border2);padding-left:16px}
+.hm span:first-child{border:none;padding:0}
+#clock{color:var(--amber);font-size:1.05rem}
+#cst{transition:color .3s}.#cst.live{color:var(--green);text-shadow:var(--gg)}
+@keyframes blink{0%,100%{opacity:1}50%{opacity:0}}
+.bl{animation:blink .9s step-end infinite}
+nav{display:flex;align-items:stretch;border-bottom:1px solid var(--border2);background:var(--bg1);padding:0 18px;gap:2px;}
+.tab{font-family:var(--fc);font-size:1rem;letter-spacing:.12em;color:var(--textdim);padding:0 16px;cursor:pointer;border:none;background:transparent;border-bottom:3px solid transparent;transition:all .15s;display:flex;align-items:center;gap:7px;position:relative;top:1px;}
+.tab:hover{color:var(--amber2)}.tab.active{color:var(--amber);border-bottom-color:var(--amber);text-shadow:var(--ga);background:rgba(255,176,0,.04)}
+.bdg{font-family:var(--fm);font-size:.6rem;background:var(--critical);color:#fff;border-radius:2px;padding:1px 5px;display:none}
+.bdg.on{display:inline-block}
+.panel{display:none;overflow:hidden;height:100%}.panel.active{display:grid}
+/* OVERVIEW */
+#po{grid-template-columns:270px 1fr 250px;grid-template-rows:1fr 1fr;gap:1px;background:var(--border)}
+.card{background:var(--bg1);overflow:hidden;display:flex;flex-direction:column}
+.ch{font-family:var(--fc);font-size:.87rem;letter-spacing:.14em;color:var(--amber-dim);padding:7px 13px;border-bottom:1px solid var(--border);flex-shrink:0;display:flex;align-items:center;justify-content:space-between;}
+.ch::before{content:'▸ ';color:var(--amber)}
+.cb{flex:1;overflow:hidden;padding:13px;display:flex;flex-direction:column}
+#gc{grid-row:1/3;align-items:center;justify-content:center}
+#gc .cb{align-items:center;justify-content:center;gap:13px}
+.gr{position:relative;width:185px;height:185px}.gr svg{transform:rotate(-90deg)}
+.gbg{fill:none;stroke:var(--bg3);stroke-width:14}
+.garc{fill:none;stroke-width:14;stroke-linecap:round;transition:stroke-dashoffset 1.2s cubic-bezier(.4,0,.2,1),stroke .5s}
+.gl{position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center}
+.glvl{font-family:var(--fh);font-size:2.1rem;letter-spacing:.1em;line-height:1}
+.gsub{font-family:var(--fc);font-size:.73rem;letter-spacing:.14em;color:var(--textdim);margin-top:4px}
+.sr{display:grid;grid-template-columns:repeat(4,1fr);gap:6px;width:100%}
+.ms{background:var(--bg2);border:1px solid var(--border);border-top:2px solid var(--border2);padding:7px 7px;text-align:center}
+.msv{font-family:var(--fh);font-size:1.45rem;line-height:1;color:var(--amber)}
+.msv.c{color:var(--critical)}.msv.h{color:var(--high)}.msv.m{color:var(--medium)}.msv.l{color:var(--low)}
+.msl{font-family:var(--fc);font-size:.68rem;color:var(--textdim);letter-spacing:.07em;margin-top:2px}
+#tlc{grid-column:2}#spark-svg{width:100%;flex:1}
+#catc{grid-column:2}
+.br{display:flex;align-items:center;gap:8px;margin-bottom:4px}
+.bl2{font-family:var(--fc);font-size:.77rem;color:var(--textdim);width:148px;flex-shrink:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.bt{flex:1;height:7px;background:var(--bg3);border:1px solid var(--border);overflow:hidden}
+.bf{height:100%;background:var(--amber-dim);transition:width .6s}
+.bc{font-family:var(--fc);font-size:.77rem;color:var(--amber);min-width:32px;text-align:right}
+#critc{grid-column:3;grid-row:1/3}
+#clist{flex:1;overflow-y:auto;display:flex;flex-direction:column;gap:5px}
+.ci{background:var(--bg2);border-left:3px solid var(--critical);padding:6px 10px}
+@keyframes si{from{opacity:0;transform:translateX(6px)}to{opacity:1;transform:none}}
+.ci{animation:si .2s ease}
+.cic{color:var(--critical);font-size:.67rem;letter-spacing:.07em}
+.cim{color:var(--text);font-size:.71rem;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;margin-top:2px}
+.cix{color:var(--textdim);font-size:.64rem;margin-top:2px}
+/* FEED */
+#pf{grid-template-rows:auto 1fr}
+.ftb{display:flex;align-items:center;gap:8px;padding:7px 12px;border-bottom:1px solid var(--border);background:var(--bg1);flex-wrap:wrap;}
+.fc2{font-family:var(--fc);font-size:.87rem;letter-spacing:.06em;padding:2px 9px;border:1px solid var(--border2);background:transparent;color:var(--textdim);cursor:pointer;transition:all .15s;}
+.fc2:hover{color:var(--amber);border-color:var(--amber-dim)}
+.fc2.active{color:var(--amber);border-color:var(--amber);background:rgba(255,176,0,.07);text-shadow:var(--ga)}
+.fc2.active.CRITICAL{color:var(--critical);border-color:var(--critical);background:rgba(255,0,85,.07)}
+.fc2.active.HIGH{color:var(--high);border-color:var(--high);background:rgba(255,68,0,.07)}
+.fc2.active.MEDIUM{color:var(--medium);border-color:var(--medium);background:rgba(255,170,0,.07)}
+.sb{font-family:var(--fm);font-size:.77rem;background:var(--bg2);border:1px solid var(--border2);color:var(--amber);padding:2px 9px;outline:none;width:190px;margin-left:auto;}
+.sb::placeholder{color:var(--textfaint)}.sb:focus{border-color:var(--amber-dim)}
+.fcnt{font-family:var(--fc);font-size:.8rem;color:var(--textdim);white-space:nowrap}
+#fs{overflow-y:auto;padding:6px;display:flex;flex-direction:column;gap:2px}
+.ar{display:grid;grid-template-columns:74px 64px 140px 1fr 115px;gap:7px;align-items:center;padding:5px 9px;border:1px solid var(--border);border-left:4px solid transparent;background:var(--bg2);cursor:pointer;transition:background .1s;}
+@keyframes rin{from{opacity:0;transform:translateY(-3px)}to{opacity:1;transform:none}}
+.ar{animation:rin .2s ease}.ar:hover{background:var(--bg3)}
+.ar.CRITICAL{border-left-color:var(--critical);background:rgba(255,0,85,.05)}
+.ar.HIGH{border-left-color:var(--high)}.ar.MEDIUM{border-left-color:var(--medium)}
+.ar.LOW{border-left-color:var(--low)}.ar.INFO{border-left-color:var(--info)}
+.lb{font-family:var(--fc);font-size:.72rem;letter-spacing:.05em;padding:1px 5px;font-weight:700}
+.lb.CRITICAL{color:var(--critical);border:1px solid var(--critical)}.lb.HIGH{color:var(--high);border:1px solid var(--high)}
+.lb.MEDIUM{color:var(--medium);border:1px solid var(--medium)}.lb.LOW{color:var(--low);border:1px solid var(--low)}
+.lb.INFO{color:var(--info);border:1px solid var(--info)}
+.ats{font-family:var(--fc);font-size:.77rem;color:var(--textdim)}
+.acat{font-family:var(--fc);font-size:.79rem;color:var(--amber);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.amsg{font-size:.75rem;color:var(--text);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.ahost{font-family:var(--fc);font-size:.71rem;color:var(--textdim);text-align:right;white-space:nowrap}
+.adet{display:none;background:var(--bg3);border:1px solid var(--border2);border-top:none;padding:9px 13px;font-size:.76rem;color:var(--text);line-height:1.7;margin-bottom:2px;}
+.adet.open{display:block}
+.dkv{display:grid;grid-template-columns:96px 1fr;column-gap:8px}
+.dk{color:var(--textdim)}.dv{color:var(--amber2);font-family:var(--fc);font-size:.8rem}
+/* AGENTS */
+#pag{grid-template-rows:auto 1fr}
+.agh{background:var(--bg1);padding:8px 13px;font-family:var(--fc);font-size:.87rem;color:var(--textdim);border-bottom:1px solid var(--border2);}
+#agrid{overflow-y:auto;padding:11px;display:grid;grid-template-columns:repeat(auto-fill,minmax(290px,1fr));gap:9px;align-content:start;}
+.agc{background:var(--bg2);border:1px solid var(--border);padding:13px 15px;display:flex;flex-direction:column;gap:6px;position:relative;overflow:hidden;}
+.agc::before{content:'';position:absolute;top:0;left:0;right:0;height:2px;background:var(--amber-dim)}
+.agc.online::before{background:var(--green);box-shadow:var(--gg)}
+.agc.offline::before{background:var(--red)}
+.agn{font-family:var(--fh);font-size:1.2rem;letter-spacing:.07em;color:var(--amber2);display:flex;align-items:center;gap:8px;}
+.sd{width:8px;height:8px;border-radius:50%;flex-shrink:0}
+.online .sd{background:var(--green);box-shadow:var(--gg);animation:pd 2s ease-in-out infinite}
+.offline .sd{background:var(--red)}
+@keyframes pd{0%,100%{opacity:1}50%{opacity:.35}}
+.agkv{display:grid;grid-template-columns:84px 1fr;row-gap:3px;font-size:.75rem}
+.ak{color:var(--textdim)}.av{color:var(--text);font-family:var(--fc);font-size:.79rem}
+.agn2{font-family:var(--fh);font-size:1.8rem;color:var(--amber);text-align:right;position:absolute;bottom:11px;right:13px;line-height:1;}
+.agn3{font-family:var(--fc);font-size:.6rem;color:var(--textdim);text-align:right;position:absolute;bottom:10px;right:13px;padding-top:21px;}
+.noa{grid-column:1/-1;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:11px;color:var(--textfaint);font-family:var(--fc);font-size:1rem;letter-spacing:.11em;padding:55px;text-align:center;}
+/* ANALYTICS */
+#pan{grid-template-columns:1fr 1fr;grid-template-rows:1fr 1fr;gap:1px;background:var(--border)}
+.anc{background:var(--bg1);display:flex;flex-direction:column;overflow:hidden}
+.anc .cb{overflow-y:auto}
+#dw{display:flex;align-items:center;justify-content:center;gap:24px;flex:1}
+#dsvg{flex-shrink:0}.dlg{display:flex;flex-direction:column;gap:7px}
+.dli{display:flex;align-items:center;gap:7px;font-family:var(--fc);font-size:.82rem}
+.dlsw{width:12px;height:12px;border-radius:2px;flex-shrink:0}.dlv{color:var(--amber);margin-left:auto;min-width:26px;text-align:right}
+#st{width:100%;border-collapse:collapse;font-family:var(--fc);font-size:.79rem}
+#st th{text-align:left;color:var(--textdim);font-weight:normal;letter-spacing:.09em;padding:4px 8px;border-bottom:1px solid var(--border2)}
+#st td{padding:5px 8px;border-bottom:1px solid var(--border);color:var(--text)}
+#st td:last-child{color:var(--amber);text-align:right}
+#st tr:hover td{background:var(--bg2)}
+#rsvg{width:100%;flex:1}
+.rl{fill:none;stroke:var(--amber);stroke-width:1.5;stroke-linejoin:round;stroke-linecap:round}
+.rf{stroke:none;fill:url(#ag2)}
+.rg{stroke:var(--border);stroke-width:1}.rlt{font-family:var(--fc);font-size:9px;fill:var(--textdim)}
+::-webkit-scrollbar{width:4px;height:4px}::-webkit-scrollbar-track{background:var(--bg)}
+::-webkit-scrollbar-thumb{background:var(--border2)}::-webkit-scrollbar-thumb:hover{background:var(--amber-dim)}
+#toasts{position:fixed;bottom:13px;right:13px;z-index:9999;display:flex;flex-direction:column;gap:5px;pointer-events:none}
+.toast{background:var(--bg2);border:1px solid var(--border2);border-left:4px solid var(--amber);padding:7px 12px;font-family:var(--fc);font-size:.82rem;color:var(--text);max-width:360px;animation:tin .2s ease,tout .3s ease 3.7s forwards;}
+.toast.CRITICAL{border-left-color:var(--critical);color:var(--critical)}.toast.HIGH{border-left-color:var(--high);color:var(--high)}
+@keyframes tin{from{opacity:0;transform:translateX(14px)}to{opacity:1;transform:none}}
+@keyframes tout{to{opacity:0;transform:translateX(14px)}}
+.empty{flex:1;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:9px;color:var(--textfaint);font-family:var(--fc);font-size:.93rem;letter-spacing:.1em;text-align:center;padding:38px;}
+.ei{font-size:2rem;opacity:.22}
 </style>
 </head>
 <body>
-
+<div id="app">
 <header>
-  <div class="logo">
-    <div class="logo-icon">⬡</div>
-    NETSENTINEL
+  <div class="logo"><span class="logo-hex">⬡</span>NETSENTINEL
+    <span style="font-family:var(--fc);font-size:.8rem;letter-spacing:.18em;color:var(--textdim);margin-left:4px">COMMAND CENTER</span>
   </div>
-  <div class="header-right">
-    <div class="conn-dot" id="conn-dot"></div>
-    <span id="conn-label">OFFLINE</span>
-    <span>|</span>
-    <span id="clock">--:--:--</span>
+  <div class="hm">
+    <span id="cst">● OFFLINE</span>
+    <span>AGENTS: <b id="ha" style="color:var(--amber)">0</b></span>
+    <span>ALERTS: <b id="ht" style="color:var(--amber)">0</b></span>
+    <span id="clock" class="bl">--:--:--</span>
   </div>
 </header>
-
-<main>
-  <!-- SIDEBAR -->
-  <aside class="sidebar">
-    <!-- counters -->
-    <div class="sidebar-section">
-      <div class="sidebar-title">Threat Overview</div>
-      <div style="display:flex; flex-direction:column; gap:.6rem;">
-        <div class="stat-card">
-          <div class="stat-label">Total Alerts</div>
-          <div class="stat-value" id="stat-total">0</div>
-        </div>
-        <div style="display:grid; grid-template-columns:1fr 1fr; gap:.6rem;">
-          <div class="stat-card high">
-            <div class="stat-label">HIGH</div>
-            <div class="stat-value" id="stat-high">0</div>
-          </div>
-          <div class="stat-card crit">
-            <div class="stat-label">CRITICAL</div>
-            <div class="stat-value" id="stat-crit">0</div>
-          </div>
-        </div>
+<nav>
+  <button class="tab active" data-tab="o">◈ OVERVIEW</button>
+  <button class="tab" data-tab="f">◉ LIVE FEED <span class="bdg" id="bdf">0</span></button>
+  <button class="tab" data-tab="ag">◎ AGENTS</button>
+  <button class="tab" data-tab="an">◆ ANALYTICS</button>
+  <div style="flex:1"></div>
+  <button class="tab" id="expb" style="color:var(--textdim);font-size:.78rem">⬇ EXPORT</button>
+</nav>
+<div class="panel active" id="po">
+  <div class="card" id="gc">
+    <div class="ch">THREAT LEVEL</div>
+    <div class="cb">
+      <div class="gr">
+        <svg width="185" height="185" viewBox="0 0 185 185">
+          <circle class="gbg" cx="92" cy="92" r="78"/>
+          <circle class="garc" id="garc" cx="92" cy="92" r="78" stroke-dasharray="490" stroke-dashoffset="490" stroke="var(--amber)"/>
+        </svg>
+        <div class="gl"><div class="glvl" id="glvl" style="color:var(--amber)">—</div><div class="gsub">THREAT STATUS</div></div>
       </div>
-    </div>
-
-    <!-- by category -->
-    <div class="sidebar-section" style="flex:0 0 auto">
-      <div class="sidebar-title">By Category</div>
-      <div id="cat-bars"></div>
-    </div>
-
-    <!-- by level -->
-    <div class="sidebar-section" style="flex:0 0 auto">
-      <div class="sidebar-title">By Severity</div>
-      <div id="level-bars"></div>
-    </div>
-
-    <!-- agents -->
-    <div class="sidebar-section" style="flex:1">
-      <div class="sidebar-title">Agents</div>
-      <div id="agent-list">
-        <div style="font-family:var(--font-mono);font-size:.72rem;color:var(--textdim);">
-          Awaiting agent connections…
-        </div>
-      </div>
-    </div>
-  </aside>
-
-  <!-- TOP BAR -->
-  <div class="top-bar">
-    <div class="stat-card" style="flex:0 0 auto; min-width:140px;">
-      <div class="stat-label">Alerts / min</div>
-      <div class="stat-value" id="stat-rate">0.0</div>
-    </div>
-    <div style="flex:1; display:flex; align-items:center; justify-content:flex-end; gap:.5rem; flex-wrap:wrap;">
-      <span style="font-family:var(--font-mono);font-size:.68rem;color:var(--textdim);margin-right:.3rem;">FILTER:</span>
-      <button class="filter-btn active" data-level="ALL">ALL</button>
-      <button class="filter-btn CRITICAL" data-level="CRITICAL">☠ CRITICAL</button>
-      <button class="filter-btn HIGH"     data-level="HIGH">⚠ HIGH</button>
-      <button class="filter-btn MEDIUM"   data-level="MEDIUM">▲ MEDIUM</button>
-      <button class="filter-btn"          data-level="LOW">● LOW</button>
-      <button class="filter-btn"          data-level="INFO">ℹ INFO</button>
-    </div>
-  </div>
-
-  <!-- FEED -->
-  <div class="feed-panel">
-    <div class="feed-header">
-      <span class="feed-title">⬡ LIVE ALERT FEED</span>
-      <span id="feed-count" style="font-family:var(--font-mono);font-size:.72rem;color:var(--textdim);">0 events</span>
-    </div>
-    <div id="alert-list">
-      <div class="empty-state" id="empty-state">
-        <div class="empty-icon">◈</div>
-        <p>No alerts yet.<br/>Start agents on monitored hosts<br/>and threats will appear here in real time.</p>
+      <div class="sr">
+        <div class="ms"><div class="msv c" id="sc">0</div><div class="msl">CRIT</div></div>
+        <div class="ms"><div class="msv h" id="sh">0</div><div class="msl">HIGH</div></div>
+        <div class="ms"><div class="msv m" id="sm">0</div><div class="msl">MED</div></div>
+        <div class="ms"><div class="msv l" id="sl">0</div><div class="msl">LOW</div></div>
       </div>
     </div>
   </div>
-</main>
-
-<div id="toast-container"></div>
-
+  <div class="card" id="tlc">
+    <div class="ch">ALERT TIMELINE — 60 MIN <span id="rtb" style="font-family:var(--fc);font-size:.76rem;color:var(--textdim)"></span></div>
+    <div class="cb" style="padding:6px"><svg id="spark-svg" preserveAspectRatio="none"></svg></div>
+  </div>
+  <div class="card" id="catc">
+    <div class="ch">TOP CATEGORIES</div>
+    <div class="cb" style="padding:9px 13px;overflow-y:auto" id="cats">
+      <div class="empty"><div class="ei">◈</div><div>No data yet</div></div>
+    </div>
+  </div>
+  <div class="card" id="critc">
+    <div class="ch">CRITICAL / HIGH</div>
+    <div class="cb" style="padding:6px">
+      <div id="clist"><div class="empty"><div class="ei">◈</div><div>No critical alerts</div></div></div>
+    </div>
+  </div>
+</div>
+<div class="panel" id="pf">
+  <div class="ftb">
+    <button class="fc2 active" data-level="ALL">ALL</button>
+    <button class="fc2 CRITICAL" data-level="CRITICAL">☠ CRITICAL</button>
+    <button class="fc2 HIGH" data-level="HIGH">⚠ HIGH</button>
+    <button class="fc2 MEDIUM" data-level="MEDIUM">▲ MEDIUM</button>
+    <button class="fc2" data-level="LOW">● LOW</button>
+    <button class="fc2" data-level="INFO">ℹ INFO</button>
+    <input class="sb" id="sb2" type="text" placeholder="SEARCH..."/>
+    <span class="fcnt" id="fcnt">0 events</span>
+  </div>
+  <div id="fs"></div>
+</div>
+<div class="panel" id="pag">
+  <div class="agh" id="agh2">REGISTERED AGENTS — 0 online / 0 total</div>
+  <div id="agrid">
+    <div class="noa"><div style="font-size:2rem;opacity:.18">◎</div><div>NO AGENTS REGISTERED</div>
+      <div style="font-size:.76rem;color:var(--textfaint)">Run sentinel_agent.py or sentinel_agent_windows.py</div></div>
+  </div>
+</div>
+<div class="panel" id="pan">
+  <div class="anc">
+    <div class="ch">SEVERITY DISTRIBUTION</div>
+    <div class="cb" style="padding:13px">
+      <div id="dw">
+        <svg id="dsvg" width="148" height="148" viewBox="0 0 148 148">
+          <defs><filter id="gf2"><feGaussianBlur stdDeviation="2" result="b"/><feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge></filter></defs>
+          <g id="dsegs"></g>
+          <text x="74" y="68" text-anchor="middle" fill="var(--amber)" font-family="'Bebas Neue'" font-size="24" id="dtot">0</text>
+          <text x="74" y="82" text-anchor="middle" fill="var(--textdim)" font-family="'VT323'" font-size="11">TOTAL</text>
+        </svg>
+        <div class="dlg" id="dlg"></div>
+      </div>
+    </div>
+  </div>
+  <div class="anc">
+    <div class="ch">TOP THREAT SOURCES</div>
+    <div class="cb" style="padding:0">
+      <table id="st"><thead><tr><th>#</th><th>SOURCE</th><th>ALERTS</th></tr></thead><tbody id="stb"></tbody></table>
+    </div>
+  </div>
+  <div class="anc">
+    <div class="ch">ALERT RATE — 60 MIN</div>
+    <div class="cb" style="padding:8px">
+      <svg id="rsvg" preserveAspectRatio="none">
+        <defs><linearGradient id="ag2" x1="0" x2="0" y1="0" y2="1">
+          <stop offset="0%" stop-color="var(--amber)" stop-opacity=".26"/>
+          <stop offset="100%" stop-color="var(--amber)" stop-opacity="0"/>
+        </linearGradient></defs>
+        <g id="rgg"></g><path id="rfp" class="rf"/><path id="rlp" class="rl"/><g id="rlg"></g>
+      </svg>
+    </div>
+  </div>
+  <div class="anc">
+    <div class="ch">FULL CATEGORY BREAKDOWN</div>
+    <div class="cb" style="padding:9px 13px;overflow-y:auto" id="ancats"></div>
+  </div>
+</div>
+</div>
+<div id="toasts"></div>
 <script>
-const socket = io({ secure: true, rejectUnauthorized: false });
-
-let allAlerts   = [];
-let activeFilter = 'ALL';
-let rateWindow  = [];
-
-// ── connection ──────────────────────────────────────────────────────────────
-socket.on('connect', () => {
-  document.getElementById('conn-dot').classList.add('live');
-  document.getElementById('conn-label').textContent = 'LIVE';
-  fetchState();
-});
-socket.on('disconnect', () => {
-  document.getElementById('conn-dot').classList.remove('live');
-  document.getElementById('conn-label').textContent = 'OFFLINE';
-});
-
-// ── real-time events ────────────────────────────────────────────────────────
-socket.on('alert', alert => {
-  allAlerts.unshift(alert);
-  rateWindow.push(Date.now());
-  renderFeed();
-  if (shouldToast(alert.level)) showToast(alert);
-});
-socket.on('stats',  updateStats);
-socket.on('agents', updateAgents);
-
-// ── initial state ────────────────────────────────────────────────────────────
-async function fetchState() {
-  try {
-    const r = await fetch('/api/state', {
-      headers: { 'X-API-Key': window._SENTINEL_KEY || '' }
-    });
-    if (!r.ok) return;
-    const d = await r.json();
-    allAlerts = d.alerts || [];
-    renderFeed();
-    updateStats(d.stats);
-    updateAgents(d.agents);
-  } catch(e) {}
+'use strict';
+let allAlerts=[],activeFilter='ALL',searchStr='',unseen=0,activeTab='o';
+let tlData=new Array(60).fill(0),stats={total:0,by_level:{},by_category:{},top_sources:{}},agData=[];
+const socket=io({secure:true,rejectUnauthorized:false});
+socket.on('connect',()=>{const e=id('cst');e.textContent='● ONLINE';e.style.color='var(--green)';e.style.textShadow='var(--gg)';fetchState();});
+socket.on('disconnect',()=>{const e=id('cst');e.textContent='● OFFLINE';e.style.color='';e.style.textShadow='';});
+socket.on('alert',a=>{allAlerts.unshift(a);if(allAlerts.length>2000)allAlerts.length=2000;onNew(a);});
+socket.on('stats',s=>{stats=s;rStats();});
+socket.on('timeline',t=>{tlData=t;rTL();rRate();});
+socket.on('agents',ag=>{agData=ag;rAgents();});
+async function fetchState(){
+  try{const r=await fetch('/api/state',{headers:{'X-API-Key':window._SK||''}});
+  if(!r.ok)return;const d=await r.json();
+  allAlerts=d.alerts||[];stats=d.stats||stats;agData=d.agents||[];tlData=d.timeline||tlData;rAll();}catch(e){}
 }
-
-// ── filters ──────────────────────────────────────────────────────────────────
-document.querySelectorAll('.filter-btn').forEach(btn => {
-  btn.addEventListener('click', () => {
-    document.querySelectorAll('.filter-btn').forEach(b => b.classList.remove('active'));
-    btn.classList.add('active');
-    activeFilter = btn.dataset.level;
-    renderFeed();
+function rAll(){rStats();rFeed();rTL();rRate();rAgents();rAnalytics();}
+document.querySelectorAll('.tab[data-tab]').forEach(b=>{
+  b.addEventListener('click',()=>{
+    activeTab=b.dataset.tab;
+    document.querySelectorAll('.tab').forEach(x=>x.classList.remove('active'));b.classList.add('active');
+    document.querySelectorAll('.panel').forEach(p=>p.classList.remove('active'));
+    id('p'+activeTab).classList.add('active');
+    if(activeTab==='f'){unseen=0;const bdg=id('bdf');bdg.textContent='0';bdg.classList.remove('on');}
+    if(activeTab==='an')rAnalytics();
+    if(activeTab==='o'){rTL();rStats();}
   });
 });
-
-function filteredAlerts() {
-  if (activeFilter === 'ALL') return allAlerts;
-  return allAlerts.filter(a => a.level === activeFilter);
+id('expb').addEventListener('click',()=>{window.location.href='/api/alerts/export';});
+document.querySelectorAll('.fc2').forEach(b=>{
+  b.addEventListener('click',()=>{document.querySelectorAll('.fc2').forEach(x=>x.classList.remove('active'));b.classList.add('active');activeFilter=b.dataset.level;rFeed();});
+});
+id('sb2').addEventListener('input',e=>{searchStr=e.target.value.toLowerCase();rFeed();});
+function onNew(a){
+  if(activeTab!=='f'){unseen++;const bdg=id('bdf');bdg.textContent=unseen>99?'99+':unseen;bdg.classList.add('on');}
+  rStats();if(activeTab==='f')prepRow(a);
+  if(['CRITICAL','HIGH'].includes(a.level)){addCrit(a);toast(a);}
 }
-
-// ── render feed ──────────────────────────────────────────────────────────────
-function renderFeed() {
-  const list   = document.getElementById('alert-list');
-  const empty  = document.getElementById('empty-state');
-  const alerts = filteredAlerts().slice(0, 400);
-
-  document.getElementById('feed-count').textContent = `${alerts.length} events`;
-
-  if (alerts.length === 0) {
-    if (!empty) {
-      list.innerHTML = `<div class="empty-state" id="empty-state">
-        <div class="empty-icon">◈</div>
-        <p>No alerts match the current filter.</p></div>`;
-    }
-    return;
-  }
-
-  // Re-render top portion only to avoid thrash
-  const rows = alerts.map(a => `
-    <div class="alert-row ${a.level}">
-      <span class="alert-level ${a.level}">${a.level}</span>
-      <span class="alert-ts">${fmtTime(a.ts)}</span>
-      <span class="alert-category">${a.category}</span>
-      <span class="alert-message" title="${escHtml(a.message)}">${escHtml(a.message)}</span>
-      <span class="alert-agent">${escHtml(a.hostname)}</span>
-    </div>`).join('');
-
-  list.innerHTML = rows;
+function rStats(){
+  const lv=stats.by_level||{};
+  setText('sc',lv.CRITICAL||0);setText('sh',lv.HIGH||0);setText('sm',lv.MEDIUM||0);setText('sl',lv.LOW||0);
+  setText('ht',stats.total||0);setText('ha',agData.filter(a=>a.online).length);
+  rGauge(lv);rCats(stats.by_category||{});
 }
-
-// ── stats ────────────────────────────────────────────────────────────────────
-function updateStats(stats) {
-  if (!stats) return;
-  set('stat-total', stats.total || 0);
-  set('stat-high',  (stats.by_level || {})['HIGH']     || 0);
-  set('stat-crit',  (stats.by_level || {})['CRITICAL'] || 0);
-
-  // Category bars
-  const catEl = document.getElementById('cat-bars');
-  const cats  = Object.entries(stats.by_category || {}).sort((a,b) => b[1]-a[1]).slice(0, 12);
-  const maxC  = cats[0]?.[1] || 1;
-  catEl.innerHTML = cats.map(([k,v]) => barRow(k, v, maxC)).join('');
-
-  // Level bars
-  const lvlEl  = document.getElementById('level-bars');
-  const levels = ['CRITICAL','HIGH','MEDIUM','LOW','INFO'];
-  const maxL   = Math.max(...levels.map(l => (stats.by_level||{})[l]||0), 1);
-  lvlEl.innerHTML = levels.map(l =>
-    barRow(l, (stats.by_level||{})[l]||0, maxL, `bar-fill ${l}`)
-  ).join('');
+function rGauge(lv){
+  const c=lv.CRITICAL||0,h=lv.HIGH||0,m=lv.MEDIUM||0;
+  let lv2,col,pct;
+  if(c>0){lv2='CRITICAL';col='var(--critical)';pct=1;}
+  else if(h>5){lv2='HIGH';col='var(--high)';pct=.75;}
+  else if(h>0){lv2='ELEVATED';col='var(--orange)';pct=.55;}
+  else if(m>0){lv2='MODERATE';col='var(--medium)';pct=.4;}
+  else{lv2='NORMAL';col='var(--green)';pct=.15;}
+  const circ=2*Math.PI*78;const arc=id('garc');const lbl=id('glvl');
+  arc.style.strokeDashoffset=circ*(1-pct);arc.style.stroke=col;
+  lbl.textContent=lv2;lbl.style.color=col;lbl.style.textShadow=`0 0 10px ${col}`;
 }
-
-function barRow(label, val, max, cls='bar-fill') {
-  const pct = max > 0 ? Math.round(val/max*100) : 0;
-  return `<div class="bar-row">
-    <span class="bar-label">${escHtml(label)}</span>
-    <div class="bar-track"><div class="${cls}" style="width:${pct}%"></div></div>
-    <span class="bar-count">${val}</span>
-  </div>`;
+function rCats(cats){
+  const b=id('cats');const e=Object.entries(cats).sort((a,c)=>c[1]-a[1]).slice(0,14);
+  if(!e.length)return;const mx=e[0][1]||1;
+  b.innerHTML=e.map(([k,v])=>`<div class="br"><span class="bl2">${esc(k)}</span><div class="bt"><div class="bf" style="width:${Math.round(v/mx*100)}%"></div></div><span class="bc">${v}</span></div>`).join('');
 }
-
-// ── agents ───────────────────────────────────────────────────────────────────
-function updateAgents(agents) {
-  if (!agents) return;
-  const el = document.getElementById('agent-list');
-  if (!agents.length) {
-    el.innerHTML = `<div style="font-family:var(--font-mono);font-size:.72rem;color:var(--textdim);">Awaiting agent connections…</div>`;
-    return;
-  }
-  el.innerHTML = agents.map(a => `
-    <div class="agent-card">
-      <div class="agent-indicator ${a.online ? 'online' : ''}"></div>
-      <div class="agent-info">
-        <div class="agent-hostname">${escHtml(a.hostname)}</div>
-        <div class="agent-meta">${escHtml(a.ip||'')} · ${a.online?'online':'offline'}</div>
-      </div>
-      <div class="agent-count">${a.alert_count}</div>
-    </div>`).join('');
+function rTL(){
+  const svg=id('spark-svg');if(!svg)return;
+  const W=svg.clientWidth||380,H=svg.clientHeight||84;
+  const data=tlData,mx=Math.max(...data,1),bw=W/data.length,p=4;
+  svg.innerHTML=data.map((v,i)=>{
+    const bh=Math.max(2,((v/mx)*(H-p*2)));const x=i*bw+1,y=H-p-bh;
+    const op=(0.28+(v/mx)*0.72).toFixed(2);
+    return `<rect x="${x.toFixed(1)}" y="${y.toFixed(1)}" width="${(bw-2).toFixed(1)}" height="${bh.toFixed(1)}" fill="var(--amber-dim)" opacity="${op}"/>`;
+  }).join('');
+  id('rtb').textContent=`${data.slice(-5).reduce((a,b)=>a+b,0)}/5min`;
 }
-
-// ── toasts ───────────────────────────────────────────────────────────────────
-function shouldToast(level) {
-  return ['HIGH','CRITICAL'].includes(level);
+function filtered(){return allAlerts.filter(a=>{if(activeFilter!=='ALL'&&a.level!==activeFilter)return false;if(searchStr&&!`${a.category} ${a.message} ${a.src} ${a.hostname}`.toLowerCase().includes(searchStr))return false;return true;});}
+function rFeed(){
+  const list=id('fs');const fa=filtered().slice(0,500);
+  setText('fcnt',`${fa.length} events`);
+  if(!fa.length){list.innerHTML='<div class="empty"><div class="ei">◈</div><div>NO ALERTS MATCH FILTER</div></div>';return;}
+  list.innerHTML=fa.map(rh).join('');
+  list.querySelectorAll('.ar').forEach(r=>r.addEventListener('click',()=>togDet(r)));
 }
-function showToast(alert) {
-  const tc  = document.getElementById('toast-container');
-  const div = document.createElement('div');
-  div.className = `toast ${alert.level}`;
-  div.textContent = `[${alert.level}] ${alert.category} — ${alert.message.slice(0,80)}`;
-  tc.appendChild(div);
-  setTimeout(() => div.remove(), 3200);
+function prepRow(a){
+  if(activeFilter!=='ALL'&&a.level!==activeFilter)return;
+  if(searchStr&&!`${a.category} ${a.message} ${a.src} ${a.hostname}`.toLowerCase().includes(searchStr))return;
+  const list=id('fs');const emp=list.querySelector('.empty');if(emp)list.innerHTML='';
+  const div=document.createElement('div');div.innerHTML=rh(a);
+  const row=div.firstElementChild;row.addEventListener('click',()=>togDet(row));list.prepend(row);
+  const rows=list.querySelectorAll('.ar');if(rows.length>500)rows[rows.length-1].remove();
+  const cnt=parseInt(id('fcnt').textContent)||0;id('fcnt').textContent=`${cnt+1} events`;
 }
-
-// ── rate calculator ───────────────────────────────────────────────────────────
-setInterval(() => {
-  const now  = Date.now();
-  const min  = now - 60000;
-  rateWindow = rateWindow.filter(t => t > min);
-  set('stat-rate', rateWindow.length.toFixed(1));
-}, 2000);
-
-// ── clock ────────────────────────────────────────────────────────────────────
-function tickClock() {
-  document.getElementById('clock').textContent =
-    new Date().toTimeString().slice(0,8);
+function rh(a){
+  const sf=JSON.stringify({ts:a.ts,src:a.src,agent_id:a.agent_id,hostname:a.hostname,message:a.message}).replace(/'/g,"&#39;");
+  return `<div class="ar ${a.level}" data-id="${a.id}" data-f='${sf}'><span class="lb ${a.level}">${a.level}</span><span class="ats">${ft(a.ts)}</span><span class="acat">${esc(a.category)}</span><span class="amsg" title="${esc(a.message)}">${esc(a.message)}</span><span class="ahost">${esc(a.hostname)}</span></div><div class="adet" id="det-${a.id}"></div>`;
 }
-setInterval(tickClock, 1000);
-tickClock();
-
-// ── utils ────────────────────────────────────────────────────────────────────
-function set(id, val) {
-  const el = document.getElementById(id);
-  if (el) el.textContent = val;
+function togDet(row){
+  const det=id('det-'+row.dataset.id);if(!det)return;
+  if(det.classList.contains('open')){det.classList.remove('open');return;}
+  const d=JSON.parse(row.dataset.f.replace(/&#39;/g,"'"));
+  det.innerHTML=`<div class="dkv"><span class="dk">TIMESTAMP</span><span class="dv">${d.ts}</span><span class="dk">SOURCE</span><span class="dv">${esc(d.src||'—')}</span><span class="dk">AGENT ID</span><span class="dv">${esc(d.agent_id)}</span><span class="dk">HOSTNAME</span><span class="dv">${esc(d.hostname)}</span><span class="dk">MESSAGE</span><span class="dv">${esc(d.message)}</span></div>`;
+  det.classList.add('open');
 }
-function fmtTime(iso) {
-  try { return new Date(iso).toTimeString().slice(0,8); } catch{return iso;}
+function addCrit(a){
+  const list=id('clist');const emp=list.querySelector('.empty');if(emp)list.innerHTML='';
+  const div=document.createElement('div');div.className='ci';
+  div.innerHTML=`<div class="cic">${esc(a.level)} · ${esc(a.category)}</div><div class="cim">${esc(a.message)}</div><div class="cix">${ft(a.ts)} · ${esc(a.hostname)}</div>`;
+  list.prepend(div);while(list.children.length>50)list.lastElementChild.remove();
 }
-function escHtml(s) {
-  return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+function rAgents(){
+  const grid=id('agrid');const on=agData.filter(a=>a.online).length;
+  setText('ha',on);id('agh2').textContent=`REGISTERED AGENTS — ${on} ONLINE / ${agData.length} TOTAL`;
+  if(!agData.length){grid.innerHTML=`<div class="noa"><div style="font-size:2rem;opacity:.18">◎</div><div>NO AGENTS REGISTERED</div><div style="font-size:.74rem;color:var(--textfaint)">Run sentinel_agent.py or sentinel_agent_windows.py</div></div>`;return;}
+  grid.innerHTML=agData.map(a=>{
+    const st=a.online?'online':'offline';const ago=a.last_seen?ts2(a.last_seen):'—';
+    const osr=a.os?`<span class="ak">OS</span><span class="av">${esc(a.os)}</span>`:'';
+    return `<div class="agc ${st}"><div class="agn"><div class="sd"></div>${esc(a.hostname)}</div><div class="agkv"><span class="ak">STATUS</span><span class="av">${st.toUpperCase()}</span><span class="ak">IP</span><span class="av">${esc(a.ip||'—')}</span><span class="ak">LAST SEEN</span><span class="av">${ago}</span><span class="ak">SINCE</span><span class="av">${fd(a.first_seen)}</span>${osr}</div><div class="agn2">${a.alert_count}</div><div class="agn3">ALERTS</div></div>`;
+  }).join('');
 }
+function rAnalytics(){rDonut();rSrc();rRate();rAnCats();}
+const DC={CRITICAL:'#ff0055',HIGH:'#ff4400',MEDIUM:'#ffaa00',LOW:'#88cc00',INFO:'#00aacc'};
+const LV=['CRITICAL','HIGH','MEDIUM','LOW','INFO'];
+function rDonut(){
+  const lv=stats.by_level||{};const tot=LV.reduce((s,l)=>s+(lv[l]||0),0);
+  const R=52,CX=74,CY=74,circ=2*Math.PI*R;let off=0,segs='',leg='';
+  LV.forEach(l=>{const v=lv[l]||0,pct=tot>0?v/tot:0,len=pct*circ;
+    if(len>0){segs+=`<circle cx="${CX}" cy="${CY}" r="${R}" fill="none" stroke="${DC[l]}" stroke-width="22" stroke-dasharray="${len.toFixed(2)} ${(circ-len).toFixed(2)}" stroke-dashoffset="${(-off).toFixed(2)}" transform="rotate(-90,${CX},${CY})" filter="url(#gf2)"/>`;off+=len;}
+    leg+=`<div class="dli"><div class="dlsw" style="background:${DC[l]}"></div><span style="color:var(--textdim)">${l}</span><span class="dlv">${v}</span></div>`;
+  });
+  id('dsegs').innerHTML=segs;id('dlg').innerHTML=leg;id('dtot').textContent=tot;
+}
+function rSrc(){
+  const src=stats.top_sources||{};const rows=Object.entries(src).sort((a,b)=>b[1]-a[1]).slice(0,10);
+  const tb=id('stb');
+  if(!rows.length){tb.innerHTML=`<tr><td colspan="3" style="color:var(--textfaint);padding:16px;text-align:center">No data yet</td></tr>`;return;}
+  tb.innerHTML=rows.map(([ip,n],i)=>`<tr><td style="color:var(--textdim)">${i+1}</td><td>${esc(ip)}</td><td>${n}</td></tr>`).join('');
+}
+function rRate(){
+  const svg=id('rsvg');if(!svg)return;
+  const W=svg.clientWidth||380,H=svg.clientHeight||105;
+  const data=tlData,mx=Math.max(...data,1);
+  const p={t:9,r:9,b:21,l:24};const iW=W-p.l-p.r,iH=H-p.t-p.b,xS=iW/(data.length-1);
+  const grid=[0,.25,.5,.75,1].map(t=>{const y=p.t+iH*(1-t),v=Math.round(mx*t);return `<line class="rg" x1="${p.l}" y1="${y.toFixed(1)}" x2="${W-p.r}" y2="${y.toFixed(1)}"/><text class="rlt" x="${p.l-4}" y="${(y+3).toFixed(1)}" text-anchor="end">${v}</text>`;}).join('');
+  const xl=[0,14,29,44,59].map(i=>{const x=p.l+i*xS;return `<text class="rlt" x="${x.toFixed(1)}" y="${H-4}" text-anchor="middle">-${59-i}m</text>`;}).join('');
+  const pts=data.map((v,i)=>`${(p.l+i*xS).toFixed(1)},${(p.t+iH*(1-v/mx)).toFixed(1)}`);
+  id('rgg').innerHTML=grid;id('rlg').innerHTML=xl;
+  id('rlp').setAttribute('d','M'+pts.join(' L'));
+  id('rfp').setAttribute('d',`M${p.l},${p.t+iH} L`+pts.join(' L')+` L${W-p.r},${p.t+iH} Z`);
+}
+function rAnCats(){
+  const cats=stats.by_category||{};const e=Object.entries(cats).sort((a,b)=>b[1]-a[1]);
+  const mx=e[0]?.[1]||1;
+  id('ancats').innerHTML=e.map(([k,v])=>`<div class="br" style="margin-bottom:5px"><span class="bl2">${esc(k)}</span><div class="bt"><div class="bf" style="width:${Math.round(v/mx*100)}%;background:var(--amber)"></div></div><span class="bc">${v}</span></div>`).join('');
+}
+function toast(a){
+  const tc=id('toasts');const d=document.createElement('div');d.className=`toast ${a.level}`;
+  d.textContent=`[${a.level}] ${a.category} — ${a.message.slice(0,86)}`;tc.appendChild(d);setTimeout(()=>d.remove(),4200);
+}
+function tick(){id('clock').textContent=new Date().toTimeString().slice(0,8);}
+setInterval(tick,1000);tick();
+window.addEventListener('resize',()=>{rTL();rRate();});
+function id(x){return document.getElementById(x);}
+function setText(i,v){const e=id(i);if(e)e.textContent=v;}
+function esc(s){return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');}
+function ft(iso){try{return new Date(iso).toTimeString().slice(0,8);}catch{return iso;}}
+function fd(iso){if(!iso)return'—';try{const d=new Date(iso);return d.toLocaleDateString()+' '+d.toTimeString().slice(0,5);}catch{return iso;}}
+function ts2(iso){if(!iso)return'—';try{const s=Math.floor((Date.now()-new Date(iso).getTime())/1000);if(s<60)return`${s}s ago`;if(s<3600)return`${Math.floor(s/60)}m ago`;return`${Math.floor(s/3600)}h ago`;}catch{return'—';}}
 </script>
 </body>
 </html>"""
-
 
 @app.route("/")
 def dashboard():
     return render_template_string(DASHBOARD_HTML)
 
-
-# ══════════════════════════════════════════════════════════════════════════════
-# ENTRY POINT
-# ══════════════════════════════════════════════════════════════════════════════
-
 def main():
-    parser = argparse.ArgumentParser(description="NetSentinel Server")
-    parser.add_argument("--config", default="sentinel_config.json")
-    args = parser.parse_args()
-
-    cfg = load_config(args.config)
-    app.config["API_KEY"] = cfg["api_key"]
-
-    host = cfg.get("server_host", "0.0.0.0")
-    port = cfg.get("server_port", 8443)
-
-    ssl_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-    ssl_ctx.load_cert_chain(cfg["server_cert"], cfg["server_key"])
-    ssl_ctx.minimum_version = ssl.TLSVersion.TLSv1_2
-    ssl_ctx.set_ciphers(
-        "ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:"
-        "ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256"
-    )
-
-    print(f"""
-  ███╗   ██╗███████╗████████╗
-  ████╗  ██║██╔════╝╚══██╔══╝
-  ██╔██╗ ██║█████╗     ██║   
-  ██║╚██╗██║██╔══╝     ██║   
-  ██║ ╚████║███████╗   ██║   
-  ╚═╝  ╚═══╝╚══════╝   ╚═╝   SENTINEL SERVER
-
-  Dashboard   → https://{host}:{port}/
-  Alert API   → https://{host}:{port}/api/alert
-  TLS         → TLS 1.2+ (ECDHE / AES-GCM)
-  Auth        → X-API-Key (shared secret)
-""")
-
+    parser=argparse.ArgumentParser(description="NetSentinel Server v4")
+    parser.add_argument("--config",default="sentinel_config.json")
+    args=parser.parse_args()
+    cfg=load_config(args.config)
+    app.config["API_KEY"]=cfg["api_key"]
+    host=cfg.get("server_host","0.0.0.0"); port=cfg.get("server_port",8443)
+    ssl_ctx=ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    ssl_ctx.load_cert_chain(cfg["server_cert"],cfg["server_key"])
+    ssl_ctx.minimum_version=ssl.TLSVersion.TLSv1_2
+    ssl_ctx.set_ciphers("ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256")
+    print(f"\n  NETSENTINEL SERVER v4  |  https://{host}:{port}/  |  TLS 1.2+ ECDHE/AES-GCM\n")
     try:
         import gevent.pywsgi
         from geventwebsocket.handler import WebSocketHandler
-        server = gevent.pywsgi.WSGIServer(
-            (host, port), app,
-            handler_class=WebSocketHandler,
-            ssl_context=ssl_ctx,
-        )
-        print(f"  [*] Listening on {host}:{port}  (gevent/TLS)  Ctrl-C to stop\n")
-        server.serve_forever()
-    except KeyboardInterrupt:
-        print("\n  [!] Server stopped.")
+        server=gevent.pywsgi.WSGIServer((host,port),app,handler_class=WebSocketHandler,ssl_context=ssl_ctx)
+        print(f"  Listening on {host}:{port}  —  Ctrl-C to stop\n"); server.serve_forever()
+    except KeyboardInterrupt: print("\n  [!] Server stopped.")
 
-
-if __name__ == "__main__":
+if __name__=="__main__":
     main()
