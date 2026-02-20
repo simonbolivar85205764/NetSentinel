@@ -631,26 +631,84 @@ def dashboard():
     # BUG-01 fix: inject API key so browser JS can call /api/state and /api/alerts/export
     return render_template_string(DASHBOARD_HTML, api_key=app.config["API_KEY"])
 
+class _SuppressSSLLog:
+    """
+    Gevent logs every SSL handshake failure (including routine browser
+    cert-warning probes) as a full traceback. This filter lets through
+    genuine application errors while silencing expected TLS noise.
+    """
+    _SSL_MARKERS = (
+        "SSLError", "SSLEOFError", "UNEXPECTED_EOF", "TLSV1_ALERT",
+        "SSLV3_ALERT", "unknown ca", "certificate unknown",
+        "EOF occurred in violation",
+    )
+    def write(self, msg):
+        if not any(m in msg for m in self._SSL_MARKERS):
+            import sys; sys.stderr.write(msg)
+    def flush(self): pass
+    def close(self): pass
+
+
 def main():
-    parser=argparse.ArgumentParser(description="NetSentinel Server v4")
+    parser=argparse.ArgumentParser(description="NetSentinel Server v4.1")
     parser.add_argument("--config",default="sentinel_config.json")
     args=parser.parse_args()
     cfg=load_config(args.config)
     app.config["API_KEY"]=cfg["api_key"]
-    host=cfg.get("server_host","0.0.0.0"); port=cfg.get("server_port",8443)
+
+    # Fix: use local variables directly (not escaped braces)
+    host=cfg.get("server_host","0.0.0.0")
+    port=cfg.get("server_port",8443)
+    display_host = "localhost" if host in ("0.0.0.0","") else host
+
     ssl_ctx=ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     ssl_ctx.load_cert_chain(cfg["server_cert"],cfg["server_key"])
     ssl_ctx.minimum_version=ssl.TLSVersion.TLSv1_2
-    ssl_ctx.set_ciphers("ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256")
+    ssl_ctx.set_ciphers(
+        "ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:"
+        "ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256"
+    )
+
     # SEC-04: prune stale agents periodically
     threading.Thread(target=_periodic_prune, daemon=True).start()
-    print(f"\n  NETSENTINEL SERVER v4.1  |  https://{{host}}:{{port}}/  |  TLS 1.2+ ECDHE/AES-GCM\n")
+
+    # SEC-05: set CORS at init time (runtime assignment is unreliable)
+    socketio.server.eio.cors_allowed_origins = [
+        f"https://{display_host}:{port}",
+        f"https://127.0.0.1:{port}",
+        f"https://localhost:{port}",
+    ]
+
+    print(f"""
+  ╔══════════════════════════════════════════════════════════════╗
+  ║   NETSENTINEL SERVER v4.1   |   TLS 1.2+  ECDHE/AES-GCM   ║
+  ╚══════════════════════════════════════════════════════════════╝
+  Dashboard : https://{display_host}:{port}/
+  Listening : {host}:{port}
+
+  NOTE: Your browser will show a certificate warning on first visit.
+  Click  Advanced → Proceed to {display_host}  to accept the
+  self-signed cert, then the dashboard will load normally.
+
+  Press Ctrl-C to stop.
+""")
+
     try:
         import gevent.pywsgi
         from geventwebsocket.handler import WebSocketHandler
-        server=gevent.pywsgi.WSGIServer((host,port),app,handler_class=WebSocketHandler,ssl_context=ssl_ctx)
-        print(f"  Listening on {host}:{port}  —  Ctrl-C to stop\n"); server.serve_forever()
-    except KeyboardInterrupt: print("\n  [!] Server stopped.")
+
+        # log=None  → suppress per-request access log lines
+        # error_log → filter out expected SSL handshake noise
+        server = gevent.pywsgi.WSGIServer(
+            (host, port), app,
+            handler_class=WebSocketHandler,
+            ssl_context=ssl_ctx,
+            log=None,
+            error_log=_SuppressSSLLog(),
+        )
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print("\n  [!] Server stopped.")
 
 if __name__=="__main__":
     main()
