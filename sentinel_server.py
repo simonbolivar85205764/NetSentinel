@@ -1,6 +1,11 @@
 #!/usr/bin/env python3
 """sentinel_server.py — NetSentinel Central Command Server (v4)
-Multi-tab GUI: Overview / Live Feed / Agents / Analytics | TLS + API-key auth
+Dual-port architecture:
+  GUI_PORT   (default 8443) — browser dashboard, SocketIO WebSocket, read-only API
+  AGENT_PORT (default 8444) — agent POST endpoints only (/api/alert, /api/agent/heartbeat)
+
+Agents never touch the GUI port; browsers never touch the agent port.
+
 pip install flask flask-socketio gevent gevent-websocket cryptography
 """
 import argparse, json, ssl, threading, time, uuid
@@ -40,8 +45,17 @@ TBUCKETS=60; timeline=deque([0]*TBUCKETS,maxlen=TBUCKETS); tl_lock=threading.Loc
 tl_last_min=int(time.time()//60); agents={}; agents_lock=threading.Lock()
 category_counts=defaultdict(int); level_counts=defaultdict(int); src_counts=defaultdict(int)
 
-app=Flask(__name__); app.config["SECRET_KEY"]=uuid.uuid4().hex
-socketio=SocketIO(app,async_mode="gevent",cors_allowed_origins=[],logger=False,engineio_logger=False)
+# ── Two Flask apps — one per port ─────────────────────────────────────────────
+# gui_app  : dashboard, SocketIO WebSocket, read-only state/export endpoints
+# agent_app: write-only agent endpoints (/api/alert, /api/agent/heartbeat)
+# Both share the module-level stores above and the same API_KEY config value.
+
+gui_app  = Flask(__name__)
+gui_app.config["SECRET_KEY"] = uuid.uuid4().hex
+socketio = SocketIO(gui_app, async_mode="gevent", cors_allowed_origins=[],
+                    logger=False, engineio_logger=False)
+
+agent_app = Flask(__name__ + "_agent")
 
 # ── helpers ───────────────────────────────────────────────────────────────────
 def _trunc(s, n=MAX_FIELD_LEN):
@@ -72,7 +86,7 @@ def _periodic_prune():
 def require_api_key(f):
     @wraps(f)
     def w(*a,**k):
-        if request.headers.get("X-API-Key","")!=app.config["API_KEY"]: return jsonify({"error":"Unauthorized"}),401
+        if request.headers.get("X-API-Key","")!=_API_KEY: return jsonify({"error":"Unauthorized"}),401
         return f(*a,**k)
     return w
 
@@ -104,12 +118,14 @@ def _tl():
 @socketio.on("connect")
 def on_connect(auth=None):
     token = (auth or {}).get("token","") if isinstance(auth,dict) else ""
-    if token != app.config["API_KEY"]:
+    if token != _API_KEY:
         from flask_socketio import disconnect as _dc; _dc(); return False
 
-@app.route("/api/alert",methods=["POST"])
-@require_api_key
+# ── Agent-port endpoints (agent_app on AGENT_PORT) ───────────────────────────
+
+@agent_app.route("/api/alert",methods=["POST"])
 def recv():
+    if request.headers.get("X-API-Key","") != _API_KEY: return jsonify({"error":"Unauthorized"}),401
     data=request.get_json(silent=True)
     if not data: return jsonify({"error":"Bad request"}),400
     if not {"level","category","message","agent_id","hostname"}.issubset(data): return jsonify({"error":"Missing fields"}),400
@@ -138,9 +154,9 @@ def recv():
     socketio.emit("alert",alert); socketio.emit("stats",_stats()); socketio.emit("timeline",_tl())
     return jsonify({"ok":True,"id":alert["id"]}),201
 
-@app.route("/api/agent/heartbeat",methods=["POST"])
-@require_api_key
+@agent_app.route("/api/agent/heartbeat",methods=["POST"])
 def hb():
+    if request.headers.get("X-API-Key","") != _API_KEY: return jsonify({"error":"Unauthorized"}),401
     data=request.get_json(silent=True) or {}
     aid=_trunc(data.get("agent_id",""),64)
     if not aid: return jsonify({"error":"Missing agent_id"}),400
@@ -155,13 +171,13 @@ def hb():
         if hostname and hostname!="unknown": agents[aid]["hostname"]=hostname
     socketio.emit("agents",_agents()); return jsonify({"ok":True}),200
 
-@app.route("/api/state",methods=["GET"])
+@gui_app.route("/api/state",methods=["GET"])
 @require_api_key
 def state():
     with alerts_lock: recent=list(alerts_store)[:500]
     return jsonify({"alerts":recent,"stats":_stats(),"agents":_agents(),"timeline":_tl()})
 
-@app.route("/api/alerts/export",methods=["GET"])
+@gui_app.route("/api/alerts/export",methods=["GET"])
 @require_api_key
 def export():
     # BUG-02 fix: return proper Response so fetch() can handle it with auth headers
@@ -626,10 +642,10 @@ function ts2(iso){if(!iso)return'—';try{const s=Math.floor((Date.now()-new Dat
 </body>
 </html>"""
 
-@app.route("/")
+@gui_app.route("/")
 def dashboard():
     # BUG-01 fix: inject API key so browser JS can call /api/state and /api/alerts/export
-    return render_template_string(DASHBOARD_HTML, api_key=app.config["API_KEY"])
+    return render_template_string(DASHBOARD_HTML, api_key=_API_KEY)
 
 class _SuppressSSLLog:
     """
@@ -650,16 +666,20 @@ class _SuppressSSLLog:
 
 
 def main():
-    parser=argparse.ArgumentParser(description="NetSentinel Server v4.1")
+    global _API_KEY
+    parser=argparse.ArgumentParser(description="NetSentinel Server v4")
     parser.add_argument("--config",default="sentinel_config.json")
     args=parser.parse_args()
     cfg=load_config(args.config)
-    app.config["API_KEY"]=cfg["api_key"]
 
-    # Fix: use local variables directly (not escaped braces)
-    host=cfg.get("server_host","0.0.0.0")
-    port=cfg.get("server_port",8443)
-    display_host = "localhost" if host in ("0.0.0.0","") else host
+    _API_KEY = cfg["api_key"]
+    gui_app.config["API_KEY"] = _API_KEY   # still needed for render_template_string
+
+    host       = cfg.get("server_host", "0.0.0.0")
+    gui_port   = cfg.get("gui_port",    8443)   # browser dashboard
+    agent_port = cfg.get("agent_port",  8444)   # agent REST API
+
+    display_host = "localhost" if host in ("0.0.0.0", "") else host
 
     ssl_ctx=ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     ssl_ctx.load_cert_chain(cfg["server_cert"],cfg["server_key"])
@@ -672,43 +692,59 @@ def main():
     # SEC-04: prune stale agents periodically
     threading.Thread(target=_periodic_prune, daemon=True).start()
 
-    # SEC-05: set CORS at init time (runtime assignment is unreliable)
+    # SEC-05: CORS locked to the GUI origin only
     socketio.server.eio.cors_allowed_origins = [
-        f"https://{display_host}:{port}",
-        f"https://127.0.0.1:{port}",
-        f"https://localhost:{port}",
+        f"https://{display_host}:{gui_port}",
+        f"https://127.0.0.1:{gui_port}",
+        f"https://localhost:{gui_port}",
     ]
 
     print(f"""
-  ╔══════════════════════════════════════════════════════════════╗
-  ║   NETSENTINEL SERVER v4.1   |   TLS 1.2+  ECDHE/AES-GCM   ║
-  ╚══════════════════════════════════════════════════════════════╝
-  Dashboard : https://{display_host}:{port}/
-  Listening : {host}:{port}
+  ╔══════════════════════════════════════════════════════════════════╗
+  ║   NETSENTINEL SERVER v4   |   TLS 1.2+  ECDHE/AES-GCM         ║
+  ╠══════════════════════════════════════════════════════════════════╣
+  ║  GUI Dashboard : https://{display_host}:{gui_port}/             
+  ║  Agent API     : https://{display_host}:{agent_port}/           
+  ╠══════════════════════════════════════════════════════════════════╣
+  ║  Agents connect to port {agent_port} — browsers to port {gui_port}
+  ╚══════════════════════════════════════════════════════════════════╝
 
   NOTE: Your browser will show a certificate warning on first visit.
-  Click  Advanced → Proceed to {display_host}  to accept the
-  self-signed cert, then the dashboard will load normally.
+  Click  Advanced → Proceed to {display_host}  to accept, then the
+  dashboard will load normally.
 
   Press Ctrl-C to stop.
 """)
 
     try:
+        import gevent
         import gevent.pywsgi
         from geventwebsocket.handler import WebSocketHandler
 
-        # log=None  → suppress per-request access log lines
-        # error_log → filter out expected SSL handshake noise
-        server = gevent.pywsgi.WSGIServer(
-            (host, port), app,
+        # Agent server — plain WSGI (no WebSocket handler needed)
+        agent_server = gevent.pywsgi.WSGIServer(
+            (host, agent_port), agent_app,
+            ssl_context=ssl_ctx,
+            log=None,
+            error_log=_SuppressSSLLog(),
+        )
+        gevent.spawn(agent_server.serve_forever)
+
+        # GUI server — WebSocket-capable for SocketIO
+        gui_server = gevent.pywsgi.WSGIServer(
+            (host, gui_port), gui_app,
             handler_class=WebSocketHandler,
             ssl_context=ssl_ctx,
             log=None,
             error_log=_SuppressSSLLog(),
         )
-        server.serve_forever()
+        gui_server.serve_forever()
+
     except KeyboardInterrupt:
         print("\n  [!] Server stopped.")
+
+# Module-level API key — set in main() before either server starts
+_API_KEY = ""
 
 if __name__=="__main__":
     main()

@@ -1,10 +1,26 @@
 #!/usr/bin/env python3
 """
-sentinel_agent.py  —  NetSentinel Monitoring Agent  (v3 + VirusTotal)
+sentinel_agent.py  —  NetSentinel Monitoring Agent  (v4 + VT-Aware Detectors)
 
-Captures and analyses network traffic, ships alerts to the central server
-over a TLS-authenticated HTTPS connection.  External IPs and DNS-queried
-domains are checked against the VirusTotal API for bad reputation.
+Detection engine redesign (v4):
+  VirusTotal is no longer a standalone alert category.  Instead, every
+  behavioural detector checks the VT reputation of the relevant external
+  endpoint (attacker source IP, exfil destination IP, or queried domain)
+  and uses that score to both lower the alert threshold and escalate the
+  severity before deciding whether to fire.
+
+VT Risk Tiers applied per endpoint
+────────────────────────────────────
+  CRITICAL  9+ engines flag malicious → thresholds × 0.10, severity → CRITICAL
+  HIGH      3–8 engines flag malicious → thresholds × 0.25, severity +1 level
+  MEDIUM    1–2 malicious OR 5+ suspicious → thresholds × 0.50, severity +1 level
+  LOW       community reputation < −10 → thresholds × 0.75, severity unchanged
+  CLEAN     no result / no API key → thresholds × 1.00, severity unchanged
+
+ARP Spoofing has no external endpoint to look up and stays CRITICAL regardless.
+The VT cache-warmer functions (detect_vt_ip / detect_vt_dns) are retained as
+passive background pre-fetchers so the cache is warm for all observed IPs,
+not just those already at a detection threshold.
 
 Dependencies:
     pip install scapy requests colorama cryptography
@@ -21,9 +37,9 @@ VIRUSTOTAL_API_KEY = ""          # ← paste your VT API key here
                                  #   or set env-var VIRUSTOTAL_API_KEY
                                  #   or add "virustotal_api_key" to sentinel_config.json
 
-# Thresholds: how many VT engines must flag something before we alert?
-VT_MALICIOUS_THRESHOLD  = 3     # engines marking it "malicious"  → HIGH/CRITICAL alert
-VT_SUSPICIOUS_THRESHOLD = 5     # engines marking it "suspicious" → MEDIUM alert
+# Thresholds: how many VT engines must flag something before we treat as known-bad?
+VT_MALICIOUS_THRESHOLD  = 3     # engines marking it "malicious"  → HIGH/CRITICAL tier
+VT_SUSPICIOUS_THRESHOLD = 5     # engines marking it "suspicious" → MEDIUM tier
 
 # Cache TTL (seconds).  Avoids hammering VT for repeated connections.
 VT_CACHE_TTL_CLEAN     = 3600   # 1 h  — remember clean results
@@ -42,6 +58,7 @@ import base64
 import collections
 import ipaddress
 import json
+import math
 import os
 import queue
 import socket
@@ -85,11 +102,12 @@ except ImportError:
 
 DEFAULT_CFG = {
     "server_host":            "127.0.0.1",
-    "server_port":            8443,
+    "server_port":            8443,   # GUI dashboard port (browser only — agents don't use this)
+    "agent_port":             8444,   # Agent API port — this is what agents POST to
     "api_key":                "",
     "ca_cert":                "certs/ca.crt",
     "virustotal_api_key":     "",
-    # Detection thresholds
+    # Detection thresholds (base values — VT tier scales these down)
     "port_scan_window":       10,
     "port_scan_threshold":    15,
     "syn_flood_window":       5,
@@ -196,7 +214,9 @@ class VirusTotalChecker:
 
     Items arrive via enqueue_ip() / enqueue_domain() (non-blocking).
     A dedicated daemon thread drains the queue, respects rate limits,
-    caches results, and fires alerts through the global alerter.
+    and caches results.  Results are consumed by the VT-aware detector
+    helpers (vt_get_tier / vt_adjusted_threshold / vt_adjusted_severity)
+    rather than being fired as independent alerts.
 
     Three-level priority for resolving the API key:
         1. VIRUSTOTAL_API_KEY constant in this script
@@ -207,16 +227,16 @@ class VirusTotalChecker:
     VT_BASE = "https://www.virustotal.com/api/v3"
 
     def __init__(self, api_key, rpm=VT_REQUESTS_PER_MINUTE):
-        self._api_key  = api_key
-        self._rate     = VTRateLimiter(rpm)
-        self._cache    = VTCache()
-        self._queue    = queue.Queue(maxsize=5000)
-        self._seen     = set()
+        self._api_key   = api_key
+        self._rate      = VTRateLimiter(rpm)
+        self._cache     = VTCache()
+        self._queue     = queue.Queue(maxsize=5000)
+        self._seen      = set()
         self._seen_lock = threading.Lock()
         self._stats      = collections.defaultdict(int)
         self._stats_lock = threading.Lock()
         self._enabled    = bool(api_key)
-        self._session  = self._make_session()
+        self._session   = self._make_session()
 
         if self._enabled:
             t = threading.Thread(target=self._worker, name="VTWorker", daemon=True)
@@ -265,10 +285,8 @@ class VirusTotalChecker:
 
     def _submit(self, indicator, kind, context):
         key = f"{kind}:{indicator}"
-        # If already cached, evaluate immediately in the calling thread
-        cached = self._cache.get(key)
-        if cached is not None:
-            self._evaluate(indicator, kind, cached, context, from_cache=True)
+        # Already cached — no need to re-queue
+        if self._cache.get(key) is not None:
             return
         # Avoid duplicates in the queue
         with self._seen_lock:
@@ -300,7 +318,25 @@ class VirusTotalChecker:
                         key, result,
                         ttl=VT_CACHE_TTL_MALICIOUS if is_bad else VT_CACHE_TTL_CLEAN,
                     )
-                    self._evaluate(indicator, kind, result, context)
+                    # Log notable findings so they appear in the console even when no
+                    # behavioural threshold has been crossed yet.
+                    mal = result.get("malicious", 0)
+                    sus = result.get("suspicious", 0)
+                    if mal >= VT_MALICIOUS_THRESHOLD:
+                        log(
+                            f"VT cache update: {indicator}  {mal} malicious / "
+                            f"{sus} suspicious  [tier: {vt_get_tier(indicator, kind)}]",
+                            Fore.RED,
+                        )
+                        with self._stats_lock:
+                            self._stats["cached_malicious"] += 1
+                    elif sus >= VT_SUSPICIOUS_THRESHOLD:
+                        log(
+                            f"VT cache update: {indicator}  {sus} suspicious",
+                            Fore.YELLOW,
+                        )
+                        with self._stats_lock:
+                            self._stats["cached_suspicious"] += 1
             except Exception as exc:
                 log(f"VT worker error ({indicator}): {exc}", Fore.YELLOW)
             finally:
@@ -311,7 +347,7 @@ class VirusTotalChecker:
         s.headers.update({
             "x-apikey":   self._api_key,
             "Accept":     "application/json",
-            "User-Agent": "NetSentinel-Agent/3.0",
+            "User-Agent": "NetSentinel-Agent/4.0",
         })
         retry = Retry(
             total=3, backoff_factor=2,
@@ -324,7 +360,8 @@ class VirusTotalChecker:
     def _lookup(self, indicator, kind):
         """Call VT API v3, return normalised result dict or None on error."""
         self._rate.acquire()
-        self._stats["requests"] += 1
+        with self._stats_lock:
+            self._stats["requests"] += 1
 
         if kind == "ip":
             url = f"{self.VT_BASE}/ip_addresses/{indicator}"
@@ -373,7 +410,6 @@ class VirusTotalChecker:
                 "harmless":   stats.get("harmless",   0),
                 "undetected": stats.get("undetected", 0),
                 "total":      sum(stats.values()),
-                # Optional metadata (availability varies by indicator type)
                 "country":    attrs.get("country", ""),
                 "as_owner":   attrs.get("as_owner", attrs.get("registrar", "")),
                 "reputation": attrs.get("reputation", 0),
@@ -387,56 +423,108 @@ class VirusTotalChecker:
             with self._stats_lock: self._stats["errors"] += 1
             return None
 
-    def _evaluate(self, indicator, kind, result, context, from_cache=False):
-        """Translate VT result into an alert when thresholds are breached."""
-        mal = result.get("malicious",  0)
-        sus = result.get("suspicious", 0)
-        tot = result.get("total",      0)
-        rep = result.get("reputation", 0)
-
-        cache_tag = " [cached]" if from_cache else ""
-        as_owner  = result.get("as_owner", "")
-        country   = result.get("country", "")
-        cats      = ", ".join(result.get("categories", [])) or None
-
-        meta = f"VT: {mal} malicious / {sus} suspicious / {tot} engines"
-        if as_owner:  meta += f"  •  AS: {as_owner}"
-        if country:   meta += f"  ({country})"
-        if cats:      meta += f"  •  {cats}"
-        meta += cache_tag
-
-        label = kind.upper()   # "IP" or "DOMAIN"
-
-        if mal >= VT_MALICIOUS_THRESHOLD:
-            # Scale severity: many engines → CRITICAL, few → HIGH
-            level = "CRITICAL" if mal >= VT_MALICIOUS_THRESHOLD * 3 else "HIGH"
-            alerter.fire(
-                level, f"VT MALICIOUS {label}",
-                f"{indicator}  —  {meta}",
-                src=indicator,
-            )
-            with self._stats_lock: self._stats["alerted_malicious"] += 1
-
-        elif sus >= VT_SUSPICIOUS_THRESHOLD:
-            alerter.fire(
-                "MEDIUM", f"VT SUSPICIOUS {label}",
-                f"{indicator}  —  {meta}",
-                src=indicator,
-            )
-            with self._stats_lock: self._stats["alerted_suspicious"] += 1
-
-        elif rep < -10:
-            # Negative community reputation score (not engine-detected but distrusted)
-            alerter.fire(
-                "LOW", f"VT LOW REPUTATION {label}",
-                f"{indicator}  reputation={rep}  —  {meta}",
-                src=indicator,
-            )
-            with self._stats_lock: self._stats["alerted_reputation"] += 1
-
 
 # Module-level singleton; instantiated in main() after key is resolved
 vt = None
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# VT-AWARE DETECTION HELPERS
+# These helpers are called inside every behavioural detector to adjust
+# thresholds and severity based on the destination's VT reputation.
+# ══════════════════════════════════════════════════════════════════════════════
+
+# Tier constants
+VT_TIER_CRITICAL = "CRITICAL"
+VT_TIER_HIGH     = "HIGH"
+VT_TIER_MEDIUM   = "MEDIUM"
+VT_TIER_LOW      = "LOW"
+VT_TIER_CLEAN    = "CLEAN"
+
+# Threshold multipliers: fraction of the base value that triggers an alert
+_VT_THRESHOLD_MULT = {
+    VT_TIER_CRITICAL: 0.10,   # fire at 10% of normal volume
+    VT_TIER_HIGH:     0.25,   # fire at 25% of normal volume
+    VT_TIER_MEDIUM:   0.50,   # fire at 50% of normal volume
+    VT_TIER_LOW:      0.75,   # fire at 75% of normal volume
+    VT_TIER_CLEAN:    1.00,   # standard threshold
+}
+
+_SEVERITY_ORDER = ["INFO", "LOW", "MEDIUM", "HIGH", "CRITICAL"]
+
+
+def vt_get_tier(target, kind="ip"):
+    """
+    Return the VT risk tier for a cached target.
+    Returns VT_TIER_CLEAN if the target is not yet in cache or VT is disabled.
+    """
+    if vt is None:
+        return VT_TIER_CLEAN
+    cached = vt._cache.get(f"{kind}:{target}")
+    if cached is None:
+        return VT_TIER_CLEAN
+    mal = cached.get("malicious",  0)
+    sus = cached.get("suspicious", 0)
+    rep = cached.get("reputation", 0)
+    if mal >= 9:
+        return VT_TIER_CRITICAL
+    if mal >= VT_MALICIOUS_THRESHOLD:
+        return VT_TIER_HIGH
+    if mal >= 1 or sus >= VT_SUSPICIOUS_THRESHOLD:
+        return VT_TIER_MEDIUM
+    if rep < -10:
+        return VT_TIER_LOW
+    return VT_TIER_CLEAN
+
+
+def vt_adjusted_threshold(base, target, kind="ip"):
+    """
+    Scale a detector's base numeric threshold down according to VT reputation.
+    Example: base=200 SYNs, tier=HIGH → ceil(200 * 0.25) = 50 SYNs.
+    """
+    tier = vt_get_tier(target, kind)
+    mult = _VT_THRESHOLD_MULT[tier]
+    return max(1, math.ceil(base * mult))
+
+
+def vt_adjusted_severity(base_severity, target, kind="ip"):
+    """
+    Escalate an alert's severity based on the VT tier of the endpoint.
+    CRITICAL tier forces CRITICAL; HIGH/MEDIUM bump up by one level.
+    """
+    tier = vt_get_tier(target, kind)
+    if tier == VT_TIER_CRITICAL:
+        return "CRITICAL"
+    if tier in (VT_TIER_HIGH, VT_TIER_MEDIUM):
+        try:
+            idx = _SEVERITY_ORDER.index(base_severity.upper())
+            return _SEVERITY_ORDER[min(idx + 1, len(_SEVERITY_ORDER) - 1)]
+        except ValueError:
+            return base_severity
+    return base_severity   # LOW or CLEAN — severity unchanged
+
+
+def vt_context_suffix(target, kind="ip"):
+    """
+    Return a human-readable VT context string appended to alert messages.
+    Returns an empty string when the target is clean or not yet cached.
+    """
+    if vt is None:
+        return ""
+    cached = vt._cache.get(f"{kind}:{target}")
+    if cached is None:
+        return ""
+    tier = vt_get_tier(target, kind)
+    if tier == VT_TIER_CLEAN:
+        return ""
+    mal = cached.get("malicious",  0)
+    sus = cached.get("suspicious", 0)
+    rep = cached.get("reputation", 0)
+    parts = []
+    if mal: parts.append(f"{mal} malicious")
+    if sus: parts.append(f"{sus} suspicious")
+    detail = ", ".join(parts) if parts else f"rep={rep}"
+    return f"  [VT:{tier} — {detail}]"
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -481,7 +569,7 @@ class AlertShipper(threading.Thread):
             "X-Agent-ID":   AGENT_ID,
             "X-Hostname":   HOSTNAME,
             "Content-Type": "application/json",
-            "User-Agent":   "NetSentinel-Agent/3.0",
+            "User-Agent":   "NetSentinel-Agent/4.0",
         })
         retry = Retry(total=5, backoff_factor=1.5,
                       status_forcelist=[500, 502, 503, 504],
@@ -616,7 +704,13 @@ class SlidingCounter:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# DETECTORS
+# DETECTORS — VT-AWARE
+#
+# Each detector now:
+#   1. Identifies the relevant external endpoint (attacker src, exfil dst, domain)
+#   2. Enqueues it for background VT lookup (non-blocking — warms the cache)
+#   3. Reads the VT-adjusted threshold and severity from the cache
+#   4. Appends a VT context suffix to the alert message when a tier is active
 # ══════════════════════════════════════════════════════════════════════════════
 
 alerter       = None
@@ -631,54 +725,112 @@ arp_lock      = threading.Lock()
 
 
 def detect_port_scan(pkt):
+    """
+    Detector 1 — Port Scan
+    VT target: source IP (the scanner / attacker).
+    Known-malicious scanners trigger alerts at a fraction of the normal port count.
+    """
     if not (pkt.haslayer(IP) and pkt.haslayer(TCP)): return
     src = pkt[IP].src
+    # Warm VT cache for the attacking source
+    if vt and not is_private(src):
+        vt.enqueue_ip(src, context="port_scan")
     port_tracker.add(src, pkt[TCP].dport)
-    up = port_tracker.unique(src, CFG["port_scan_window"])
-    if len(up) >= CFG["port_scan_threshold"]:
-        alerter.fire("HIGH", "PORT SCAN",
+    up        = port_tracker.unique(src, CFG["port_scan_window"])
+    threshold = vt_adjusted_threshold(CFG["port_scan_threshold"], src)
+    if len(up) >= threshold:
+        severity = vt_adjusted_severity("HIGH", src)
+        alerter.fire(
+            severity, "PORT SCAN",
             f"{src} probed {len(up)} ports in {CFG['port_scan_window']}s "
-            f"(sample: {sorted(up)[:8]}...)", src=src)
+            f"(sample: {sorted(up)[:8]}...)"
+            f"{vt_context_suffix(src)}",
+            src=src,
+        )
 
 
 def detect_syn_flood(pkt):
+    """
+    Detector 2 — SYN Flood
+    VT target: source IP.
+    Known-malicious flooders trigger alerts much earlier (threshold × 0.10–0.25).
+    """
     if not (pkt.haslayer(IP) and pkt.haslayer(TCP)): return
     flags = pkt[TCP].flags
     if not (flags & 0x02 and not flags & 0x10): return
     src = pkt[IP].src
+    if vt and not is_private(src):
+        vt.enqueue_ip(src, context="syn_flood")
     syn_tracker.add(src)
-    n = syn_tracker.count(src, CFG["syn_flood_window"])
-    if n >= CFG["syn_flood_threshold"]:
-        alerter.fire("CRITICAL", "SYN FLOOD",
-            f"{src} sent {n} SYNs in {CFG['syn_flood_window']}s", src=src)
+    n         = syn_tracker.count(src, CFG["syn_flood_window"])
+    threshold = vt_adjusted_threshold(CFG["syn_flood_threshold"], src)
+    if n >= threshold:
+        severity = vt_adjusted_severity("CRITICAL", src)
+        alerter.fire(
+            severity, "SYN FLOOD",
+            f"{src} sent {n} SYNs in {CFG['syn_flood_window']}s"
+            f"{vt_context_suffix(src)}",
+            src=src,
+        )
 
 
 def detect_icmp_flood(pkt):
+    """
+    Detector 3 — ICMP Flood
+    VT target: source IP.
+    """
     if not (pkt.haslayer(IP) and pkt.haslayer(ICMP)): return
     if pkt[ICMP].type != 8: return
     src = pkt[IP].src
+    if vt and not is_private(src):
+        vt.enqueue_ip(src, context="icmp_flood")
     icmp_tracker.add(src)
-    n = icmp_tracker.count(src, CFG["icmp_flood_window"])
-    if n >= CFG["icmp_flood_threshold"]:
-        alerter.fire("HIGH", "ICMP FLOOD",
-            f"{src} sent {n} ICMP echo-requests in {CFG['icmp_flood_window']}s", src=src)
+    n         = icmp_tracker.count(src, CFG["icmp_flood_window"])
+    threshold = vt_adjusted_threshold(CFG["icmp_flood_threshold"], src)
+    if n >= threshold:
+        severity = vt_adjusted_severity("HIGH", src)
+        alerter.fire(
+            severity, "ICMP FLOOD",
+            f"{src} sent {n} ICMP echo-requests in {CFG['icmp_flood_window']}s"
+            f"{vt_context_suffix(src)}",
+            src=src,
+        )
 
 
 def detect_suspicious_port(pkt):
+    """
+    Detector 4 — Suspicious Port
+    VT target: the external endpoint (whichever of src/dst is not private).
+    A VT-flagged IP communicating on a C2 port immediately escalates to HIGH/CRITICAL.
+    """
     if not (pkt.haslayer(IP) and (pkt.haslayer(TCP) or pkt.haslayer(UDP))): return
     layer = TCP if pkt.haslayer(TCP) else UDP
-    src, dst = pkt[IP].src, pkt[IP].dst
+    src, dst   = pkt[IP].src, pkt[IP].dst
     sport, dport = pkt[layer].sport, pkt[layer].dport
+    # Pick the external endpoint as the VT target
+    vt_target  = dst if is_private(src) else src
+    vt_kind    = "ip"
+    if vt and not is_private(vt_target):
+        vt.enqueue_ip(vt_target, context="suspicious_port")
     for port in (sport, dport):
         if port in SUSPICIOUS_PORTS:
             direction = "->" if port == dport else "<-"
-            alerter.fire("MEDIUM", "SUSPICIOUS PORT",
-                f"{src}:{sport} {direction} {dst}:{dport}  (port {port} = C2/backdoor)",
-                src=f"{src}:{port}")
+            severity  = vt_adjusted_severity("MEDIUM", vt_target, vt_kind)
+            alerter.fire(
+                severity, "SUSPICIOUS PORT",
+                f"{src}:{sport} {direction} {dst}:{dport}  "
+                f"(port {port} = C2/backdoor)"
+                f"{vt_context_suffix(vt_target, vt_kind)}",
+                src=f"{src}:{port}",
+            )
             break
 
 
 def detect_arp_spoof(pkt):
+    """
+    Detector 5 — ARP Spoofing
+    No external IP to query — stays CRITICAL unconditionally.
+    """
     if not pkt.haslayer(ARP): return
     arp = pkt[ARP]
     if arp.op != 2: return
@@ -689,67 +841,114 @@ def detect_arp_spoof(pkt):
             if len(arp_table) < 10000:
                 arp_table[ip] = mac
         elif known != mac:
-            alerter.fire("CRITICAL", "ARP SPOOFING",
-                f"IP {ip} MAC changed: {known} -> {mac}  (MITM?)", src=ip)
+            alerter.fire(
+                "CRITICAL", "ARP SPOOFING",
+                f"IP {ip} MAC changed: {known} -> {mac}  (MITM?)",
+                src=ip,
+            )
             arp_table[ip] = mac
 
 
 def detect_dns_tunnelling(pkt):
+    """
+    Detector 6 — DNS Tunnelling
+    VT target: the queried domain.
+    If the domain is already flagged as malicious, even shorter queries trigger.
+    """
     if not (pkt.haslayer(DNS) and pkt.haslayer(DNSQR)): return
     try:
         qname = pkt[DNSQR].qname.decode(errors="replace").rstrip(".")
     except Exception:
         return
-    if len(qname) >= CFG["dns_tunnel_query_len"]:
-        src = pkt[IP].src if pkt.haslayer(IP) else "?"
-        alerter.fire("MEDIUM", "DNS TUNNELLING",
-            f"{src} queried {len(qname)}-char name: {qname[:80]}...", src=src)
+    src    = pkt[IP].src if pkt.haslayer(IP) else "?"
+    domain = qname.lower()
+    if vt:
+        vt.enqueue_domain(domain, context=src)
+    # VT-adjusted length threshold: flagged domains alert on shorter names
+    threshold = vt_adjusted_threshold(CFG["dns_tunnel_query_len"], domain, kind="domain")
+    if len(qname) >= threshold:
+        severity = vt_adjusted_severity("MEDIUM", domain, kind="domain")
+        alerter.fire(
+            severity, "DNS TUNNELLING",
+            f"{src} queried {len(qname)}-char name: {qname[:80]}..."
+            f"{vt_context_suffix(domain, kind='domain')}",
+            src=src,
+        )
 
 
 def detect_exfiltration(pkt):
+    """
+    Detector 7 — Data Exfiltration
+    VT target: destination IP (the external recipient of the data).
+    Sending data to a known-malicious host triggers at a much lower byte count.
+    """
     if not pkt.haslayer(IP): return
     src = pkt[IP].src
     if not is_private(src): return
+    dst = pkt[IP].dst
+    if vt and not is_private(dst):
+        vt.enqueue_ip(dst, context="exfil")
     exfil_tracker.add(src, len(pkt))
-    total = exfil_tracker.sum(src, CFG["exfil_window"])
-    if total >= CFG["exfil_bytes_threshold"]:
-        alerter.fire("HIGH", "DATA EXFILTRATION",
-            f"{src} sent {total/1000000:.1f} MB in {CFG['exfil_window']}s", src=src)
+    total     = exfil_tracker.sum(src, CFG["exfil_window"])
+    threshold = vt_adjusted_threshold(CFG["exfil_bytes_threshold"], dst)
+    if total >= threshold:
+        severity = vt_adjusted_severity("HIGH", dst)
+        alerter.fire(
+            severity, "DATA EXFILTRATION",
+            f"{src} sent {total / 1_000_000:.1f} MB in {CFG['exfil_window']}s "
+            f"→ {dst}"
+            f"{vt_context_suffix(dst)}",
+            src=src,
+        )
 
 
 def detect_brute_force(pkt):
+    """
+    Detector 8 — Brute Force
+    VT target: source IP (the attacker).
+    Known-malicious brute-forcers trigger after far fewer attempts.
+    """
     if not (pkt.haslayer(IP) and pkt.haslayer(TCP)): return
     flags = pkt[TCP].flags
     if not (flags & 0x02 and not flags & 0x10): return
-    BRUTE_PORTS = {21,22,23,25,110,143,389,445,1433,3306,3389,5432,5900}
+    BRUTE_PORTS = {21, 22, 23, 25, 110, 143, 389, 445, 1433, 3306, 3389, 5432, 5900}
     dport = pkt[TCP].dport
     if dport not in BRUTE_PORTS: return
     src = pkt[IP].src
+    if vt and not is_private(src):
+        vt.enqueue_ip(src, context="brute_force")
     key = f"{src}:{dport}"
     bf_tracker.add(key)
-    n = bf_tracker.count(key, CFG["bruteforce_window"])
-    if n >= CFG["bruteforce_threshold"]:
-        svc = {22:"SSH",23:"Telnet",3389:"RDP",445:"SMB",21:"FTP",
-               3306:"MySQL",5432:"PgSQL",5900:"VNC",1433:"MSSQL",
-               25:"SMTP",110:"POP3",143:"IMAP",389:"LDAP"}.get(dport, str(dport))
-        alerter.fire("HIGH", "BRUTE FORCE",
-            f"{src} -> {n} attempts on port {dport}/{svc} in {CFG['bruteforce_window']}s",
-            src=src)
+    n         = bf_tracker.count(key, CFG["bruteforce_window"])
+    threshold = vt_adjusted_threshold(CFG["bruteforce_threshold"], src)
+    if n >= threshold:
+        svc = {22: "SSH", 23: "Telnet", 3389: "RDP", 445: "SMB", 21: "FTP",
+               3306: "MySQL", 5432: "PgSQL", 5900: "VNC", 1433: "MSSQL",
+               25: "SMTP", 110: "POP3", 143: "IMAP", 389: "LDAP"}.get(dport, str(dport))
+        severity = vt_adjusted_severity("HIGH", src)
+        alerter.fire(
+            severity, "BRUTE FORCE",
+            f"{src} -> {n} attempts on port {dport}/{svc} in {CFG['bruteforce_window']}s"
+            f"{vt_context_suffix(src)}",
+            src=src,
+        )
 
 
-# ── VirusTotal detectors ───────────────────────────────────────────────────────
+# ── Passive VT cache warmers ───────────────────────────────────────────────────
+# These no longer fire independent alerts.  Their sole job is to proactively
+# populate the VT cache for ALL observed external IPs and DNS names so that
+# the first time any detector checks vt_get_tier() the answer is already there.
 
 def detect_vt_ip_reputation(pkt):
-    """Queue every new external destination IP for VT reputation check."""
+    """Cache warmer: enqueue every new external destination IP for VT lookup."""
     if vt is None or not pkt.haslayer(IP): return
     dst = pkt[IP].dst
     if VT_SKIP_PRIVATE and is_private(dst): return
-    src = pkt[IP].src
-    vt.enqueue_ip(dst, context=src)
+    vt.enqueue_ip(dst)
 
 
 def detect_vt_dns_reputation(pkt):
-    """Queue every DNS-queried domain name for VT reputation check."""
+    """Cache warmer: enqueue every DNS-queried domain for VT lookup."""
     if vt is None: return
     if not (pkt.haslayer(DNS) and pkt.haslayer(DNSQR)): return
     try:
@@ -773,8 +972,8 @@ DETECTORS = [
     detect_dns_tunnelling,
     detect_exfiltration,
     detect_brute_force,
-    detect_vt_ip_reputation,    # VirusTotal IP check
-    detect_vt_dns_reputation,   # VirusTotal domain check
+    detect_vt_ip_reputation,    # passive cache warmer — no independent alert
+    detect_vt_dns_reputation,   # passive cache warmer — no independent alert
 ]
 
 
@@ -799,7 +998,7 @@ def stats_reporter(interval=30):
         time.sleep(interval)
         _prune_cycle += 1
         if _prune_cycle % 10 == 0:
-            for t in (port_tracker,syn_tracker,icmp_tracker,exfil_tracker,bf_tracker):
+            for t in (port_tracker, syn_tracker, icmp_tracker, exfil_tracker, bf_tracker):
                 t.prune_empty()
         with pkt_lock:
             n = pkt_count
@@ -811,15 +1010,15 @@ def stats_reporter(interval=30):
         print(f"  Detections: {dict(alerter.counts)}")
         if vt_stats:
             print(
-                f"  VT: {vt_stats.get('requests',0)} requests  "
-                f"{vt_stats.get('hits',0)} hits  "
-                f"{vt_stats.get('errors',0)} errors  "
+                f"  VT: {vt_stats.get('requests', 0)} requests  "
+                f"{vt_stats.get('hits', 0)} hits  "
+                f"{vt_stats.get('errors', 0)} errors  "
                 f"{vt_cache} cached"
             )
             print(
-                f"  VT alerts: malicious={vt_stats.get('alerted_malicious',0)}  "
-                f"suspicious={vt_stats.get('alerted_suspicious',0)}  "
-                f"low-rep={vt_stats.get('alerted_reputation',0)}"
+                f"  VT cache: malicious={vt_stats.get('cached_malicious', 0)}  "
+                f"suspicious={vt_stats.get('cached_suspicious', 0)}  "
+                f"(thresholds/severities scaled live per tier)"
             )
         print(f"{'─'*68}{Style.RESET_ALL}\n")
 
@@ -843,12 +1042,6 @@ def choose_interface():
 
 
 def resolve_vt_key(cfg):
-    """
-    Resolve the VirusTotal API key with this priority order:
-      1. VIRUSTOTAL_API_KEY constant at the top of this script
-      2. VIRUSTOTAL_API_KEY environment variable
-      3. "virustotal_api_key" field in sentinel_config.json
-    """
     if VIRUSTOTAL_API_KEY:
         return VIRUSTOTAL_API_KEY
     env_key = os.environ.get("VIRUSTOTAL_API_KEY", "")
@@ -860,7 +1053,7 @@ def resolve_vt_key(cfg):
 def main():
     global alerter, CFG, vt
 
-    parser = argparse.ArgumentParser(description="NetSentinel Agent v3")
+    parser = argparse.ArgumentParser(description="NetSentinel Agent v4")
     parser.add_argument("--config", default="sentinel_config.json")
     parser.add_argument("--server", default="",
                         help="Override server URL, e.g. https://192.168.1.10:8443")
@@ -879,14 +1072,14 @@ def main():
     else:
         print(f"{Fore.YELLOW}[!] Config not found — using defaults{Style.RESET_ALL}")
 
-    # Build server URL
+    # Build server URL — agents post to the AGENT_PORT, not the GUI port
     server_url = args.server
     if not server_url:
-        host = CFG.get("server_host", "127.0.0.1")
-        port = CFG.get("server_port", 8443)
+        host       = CFG.get("server_host", "127.0.0.1")
+        agent_port = CFG.get("agent_port",  8444)
         if host in ("0.0.0.0", ""):
             host = "127.0.0.1"
-        server_url = f"https://{host}:{port}"
+        server_url = f"https://{host}:{agent_port}"
 
     api_key = CFG.get("api_key", "")
     ca_cert = CFG.get("ca_cert", "certs/ca.crt")
@@ -904,15 +1097,24 @@ def main():
         f"{Fore.YELLOW}DISABLED  (set VIRUSTOTAL_API_KEY to enable){Style.RESET_ALL}"
     )
 
+    gui_port = CFG.get("server_port", 8443)
     print(f"""
   +---------------------------------------------------------+
-  |   N E T S E N T I N E L   A G E N T   v 3              |
+  |   N E T S E N T I N E L   A G E N T   v 4              |
   +---------------------------------------------------------+
   Agent ID   : {AGENT_ID}
   Hostname   : {HOSTNAME}
-  Server     : {server_url}
+  Agent API  : {server_url}  ← alerts posted here
+  GUI Port   : {gui_port}     ← browser dashboard (not used by agent)
   CA Cert    : {ca_cert}
   VirusTotal : {vt_status}
+
+  VT-aware detection: thresholds and severities scale live
+  based on destination/source VT reputation tier:
+    CRITICAL (9+ engines)  → ×0.10 threshold, forced CRITICAL
+    HIGH     (3–8 engines) → ×0.25 threshold, severity +1
+    MEDIUM   (1–2 / 5+sus) → ×0.50 threshold, severity +1
+    LOW      (rep < −10)   → ×0.75 threshold, severity unchanged
 """)
 
     # Start background threads
@@ -934,8 +1136,7 @@ def main():
         if vt_stats:
             print(
                 f"    VT requests    : {vt_stats.get('requests', 0)}  "
-                f"| VT alerts fired: "
-                f"{vt_stats.get('alerted_malicious', 0) + vt_stats.get('alerted_suspicious', 0)}"
+                f"| VT cached malicious: {vt_stats.get('cached_malicious', 0)}"
             )
         print(Style.RESET_ALL)
 

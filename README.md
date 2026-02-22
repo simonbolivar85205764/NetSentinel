@@ -1,30 +1,31 @@
-# NetSentinel v3 — Distributed Network Intrusion Detection System
+# NetSentinel v4 — Distributed Network Intrusion Detection System
 
 A production-grade distributed IDS: cross-platform monitoring agents capture
-packets, run 10 threat detectors (including live VirusTotal reputation checks),
-and ship encrypted alerts to a central server with a real-time multi-tab
-command-center dashboard.
+packets, run 8 threat detectors with live VirusTotal-aware thresholds and
+severity escalation, and ship encrypted alerts to a central server with a
+real-time multi-tab command-center dashboard.
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────┐
 │                          Architecture                                   │
 │                                                                         │
 │  Linux Host                    TLS 1.2+  /  API Key                     │
-│  sentinel_agent.py  ─────────────────────────────────►                  │
-│                                                        sentinel_server  │
-│  Windows Host                                          .py              │
-│  sentinel_agent_windows.py  ────────────────────────►   │               │
-│    └─ system tray icon                                  │ WebSocket     │
-│    └─ Windows Service                                   │               │
-│    └─ Event Log integration                             ▼               │
-│                                                    Browser GUI          │
-│  macOS Host                                        https://server:8443/ │
-│  sentinel_agent.py  ─────────────────────────────►  ┌───────────────┐   │
-│                                                     │  Overview     │   │
-│         VirusTotal API v3                           │  Live Feed    │   │
-│         ┌─────────────┐                             │  Agents       │   │
-│         │  IP / Domain│◄── all agents check here    │  Analytics    │   │
-│         └─────────────┘                             └───────────────┘   │
+│  sentinel_agent.py  ──────────────────────────────────►                 │
+│                                                         sentinel_server  │
+│  Windows Host                   port 8444 (agent API)  .py             │
+│  sentinel_agent_windows.py  ──────────────────────────►  │              │
+│    └─ system tray icon                                   │ port 8443    │
+│    └─ Windows Service                                    │ WebSocket    │
+│    └─ Event Log integration                              │              │
+│                                                          ▼              │
+│         VirusTotal API v3               Browser GUI                     │
+│         ┌─────────────┐                 https://server:8443/            │
+│         │  IP / Domain│◄── all agents   ┌───────────────┐              │
+│         └─────────────┘    check here   │  Overview     │              │
+│                                         │  Live Feed    │              │
+│  Port 8443  ─── GUI dashboard only      │  Agents       │              │
+│  Port 8444  ─── Agent REST API only     │  Analytics    │              │
+│                                         └───────────────┘              │
 └─────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -93,7 +94,9 @@ This creates:
 python3 sentinel_server.py
 ```
 
-The startup banner prints the dashboard URL with the actual host and port.
+The startup banner prints both URLs:
+- **GUI Dashboard** → `https://<host>:8443/` (open in your browser)
+- **Agent API** → `https://<host>:8444/` (agents connect here automatically)
 
 ### Step 3 — Accept the certificate warning in your browser
 
@@ -131,9 +134,12 @@ python sentinel_agent_windows.py --no-tray
 
 Override the server URL if needed:
 ```bash
-sudo python3 sentinel_agent.py --server https://192.168.1.50:8443
+sudo python3 sentinel_agent.py --server https://192.168.1.50:8444
 sudo python3 sentinel_agent.py --iface eth1     # specific interface
 ```
+
+> **Port note:** `--server` should point to the **agent API port** (default 8444), not the GUI port.
+> Agents read `agent_port` from `sentinel_config.json` automatically.
 
 ---
 
@@ -170,9 +176,39 @@ Open a browser at `https://<server-ip>:8443/` (accept the self-signed cert warni
 
 ---
 
-## VirusTotal Integration
+## VirusTotal Integration (v4 — VT-Aware Detection)
 
-Every agent checks external IPs and DNS-queried domains against the VirusTotal API in real time using a non-blocking background thread.
+Every agent checks external IPs and DNS-queried domains against the VirusTotal
+API in real time using a non-blocking background thread.  In v4, VT results are
+no longer standalone alerts.  Instead, **every behavioural detector reads the
+VT reputation of its relevant endpoint** and uses that to automatically lower
+its alert threshold and escalate its severity.
+
+### VT Risk Tiers
+
+| Tier | Condition | Threshold multiplier | Severity change |
+|---|---|---|---|
+| **CRITICAL** | 9+ engines flag malicious | × 0.10 (fire at 10% of normal) | Forced to CRITICAL |
+| **HIGH** | 3–8 engines flag malicious | × 0.25 | +1 level |
+| **MEDIUM** | 1–2 malicious or 5+ suspicious | × 0.50 | +1 level |
+| **LOW** | Community reputation < −10 | × 0.75 | Unchanged (VT note added) |
+| **CLEAN** | No result / no API key | × 1.00 | Unchanged |
+
+**Example:** A SYN flood from a CRITICAL-tier IP triggers at 20 SYNs (200 × 0.10)
+instead of 200 and is forced to CRITICAL regardless of the base severity.
+
+### VT target per detector
+
+| Detector | VT endpoint checked |
+|---|---|
+| Port Scan | Source IP (the scanner) |
+| SYN Flood | Source IP (the flooder) |
+| ICMP Flood | Source IP |
+| Suspicious Port | External endpoint (src if external, else dst) |
+| ARP Spoofing | N/A — always CRITICAL (no external IP) |
+| DNS Tunnelling | Queried domain name |
+| Data Exfiltration | Destination IP (recipient of the data) |
+| Brute Force | Source IP (the attacker) |
 
 ### Setting your API key
 
@@ -197,33 +233,31 @@ $env:VIRUSTOTAL_API_KEY = "your_key_here"          # PowerShell
 { "virustotal_api_key": "your_key_here" }
 ```
 
-### Alert severity
-
-| VT result | Alert level |
-|---|---|
-| 9+ engines flag as malicious | CRITICAL |
-| 3–8 engines flag as malicious | HIGH |
-| 5+ engines flag as suspicious | MEDIUM |
-| Community reputation < −10 | LOW |
+Without an API key all detectors still function normally using their base
+thresholds and severities (CLEAN tier).
 
 ---
 
 ## Threat Detectors
 
-All 10 detectors run on every agent. Thresholds are configurable in `sentinel_config.json`.
+All 8 detectors run on every agent.  Base thresholds are configurable in
+`sentinel_config.json` and are automatically scaled down at runtime by the
+VT tier of the relevant endpoint.
 
-| # | Category | Trigger | Default Severity |
-|---|---|---|---|
-| 1 | **Port Scan** | 15+ unique destination ports from one IP in 10 s | HIGH |
-| 2 | **SYN Flood** | 200+ SYN-only packets from one IP in 5 s | CRITICAL |
-| 3 | **ICMP Flood** | 100+ echo-requests from one IP in 5 s | HIGH |
-| 4 | **Suspicious Port** | Traffic to/from known C2/backdoor ports (4444, 31337, etc.) | MEDIUM |
-| 5 | **ARP Spoofing** | IP→MAC mapping changes (MITM detection) | CRITICAL |
-| 6 | **DNS Tunnelling** | DNS query name longer than 50 characters | MEDIUM |
-| 7 | **Data Exfiltration** | 5 MB+ outbound from one internal host in 60 s | HIGH |
-| 8 | **Brute Force** | 30+ SYN attempts to SSH/RDP/FTP/SMB/etc. in 30 s | HIGH |
-| 9 | **VT Malicious IP** | Destination IP flagged by 3+ VT engines | HIGH / CRITICAL |
-| 10 | **VT Malicious Domain** | DNS-queried domain flagged by 3+ VT engines | HIGH / CRITICAL |
+| # | Category | Base Trigger | Base Severity | VT endpoint |
+|---|---|---|---|---|
+| 1 | **Port Scan** | 15+ unique dst ports from one IP in 10 s | HIGH | Source IP |
+| 2 | **SYN Flood** | 200+ SYN-only packets from one IP in 5 s | CRITICAL | Source IP |
+| 3 | **ICMP Flood** | 100+ echo-requests from one IP in 5 s | HIGH | Source IP |
+| 4 | **Suspicious Port** | Traffic to/from known C2/backdoor ports | MEDIUM | External endpoint |
+| 5 | **ARP Spoofing** | IP→MAC mapping changes (MITM detection) | CRITICAL | N/A |
+| 6 | **DNS Tunnelling** | DNS query name longer than 50 chars | MEDIUM | Queried domain |
+| 7 | **Data Exfiltration** | 5 MB+ outbound from one host in 60 s | HIGH | Destination IP |
+| 8 | **Brute Force** | 30+ SYN attempts to SSH/RDP/etc. in 30 s | HIGH | Source IP |
+
+Two passive **VT cache-warmer** functions run alongside the detectors to
+pre-populate the cache for all observed external IPs and queried domains.
+They do not fire alerts independently.
 
 ---
 
@@ -277,6 +311,8 @@ For production, replace the self-signed certs with certs from your internal CA o
 {
   "server_host":           "0.0.0.0",
   "server_port":           8443,
+  "gui_port":              8443,
+  "agent_port":            8444,
   "api_key":               "<generated>",
   "ca_cert":               "certs/ca.crt",
   "server_cert":           "certs/server.crt",
@@ -297,6 +333,12 @@ For production, replace the self-signed certs with certs from your internal CA o
   "alert_cooldown":        15
 }
 ```
+
+| Key | Default | Purpose |
+|---|---|---|
+| `server_port` / `gui_port` | `8443` | Browser dashboard + SocketIO WebSocket |
+| `agent_port` | `8444` | Agent REST API (`/api/alert`, `/api/agent/heartbeat`) |
+| `server_host` | `0.0.0.0` | Bind address for both servers |
 
 `alert_cooldown` (seconds) — minimum time between repeated alerts for the same source/category pair.
 
@@ -327,6 +369,12 @@ For production, replace the self-signed certs with certs from your internal CA o
 
 **VirusTotal rate limit warnings**
 → Exceeding your tier's quota. Lower `VT_REQUESTS_PER_MINUTE` in the agent script, or upgrade your VT account.
+
+**VT reputation available but detector didn't escalate**
+→ VT lookups are async. The cache is populated in the background after the first packet from an IP is seen. Subsequent packets will use the cached tier. For long-running connections, the second alert cycle will already be VT-aware.
+
+**Alerts show `[VT:HIGH — 5 malicious]` in the message**
+→ This is expected — the VT context suffix is appended to every alert where the relevant endpoint has a non-CLEAN tier.
 
 **Dashboard shows agent as offline even though it's running**
 → An agent is marked offline after 90 seconds without a heartbeat. Check that the agent can reach the server on port 8443 and the firewall allows it.
