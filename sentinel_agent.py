@@ -26,7 +26,7 @@ Dependencies:
     pip install scapy requests colorama cryptography
 
 Run (as root):
-    sudo python3 sentinel_agent.py [--config sentinel_config.json] [--server https://host:8443]
+    sudo python3 sentinel_agent.py [--config sentinel_config.json] [--server https://host:8444]
 """
 
 # ══════════════════════════════════════════════════════════════════════════════

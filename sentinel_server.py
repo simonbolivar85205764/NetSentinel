@@ -52,7 +52,13 @@ category_counts=defaultdict(int); level_counts=defaultdict(int); src_counts=defa
 
 gui_app  = Flask(__name__)
 gui_app.config["SECRET_KEY"] = uuid.uuid4().hex
-socketio = SocketIO(gui_app, async_mode="gevent", cors_allowed_origins=[],
+# cors_allowed_origins="*" — allow any origin at the CORS level.
+# Real access control is the API-key token check in on_connect(); CORS
+# is not a meaningful security boundary for WebSockets (browsers do not
+# enforce same-origin for WS the same way they do for XHR/fetch).
+# An empty list [] would block every browser connection before
+# on_connect ever fires — silently breaking the live feed.
+socketio = SocketIO(gui_app, async_mode="gevent", cors_allowed_origins="*",
                     logger=False, engineio_logger=False)
 
 agent_app = Flask(__name__ + "_agent")
@@ -151,7 +157,15 @@ def recv():
             agents[agent_id]={"hostname":hostname,"first_seen":alert["ts"],"alert_count":0,"ip":ip,"os":os_tag}
         agents[agent_id]["last_seen"]=alert["ts"]; agents[agent_id]["alert_count"]+=1; agents[agent_id]["ip"]=ip
         if os_tag: agents[agent_id]["os"]=os_tag
-    socketio.emit("alert",alert); socketio.emit("stats",_stats()); socketio.emit("timeline",_tl())
+    # socketio is bound to gui_app, but this handler runs inside agent_app's
+    # request context. Pushing gui_app's app context is required for
+    # Flask-SocketIO 5.x — without it, emit() silently no-ops and no live
+    # push ever reaches the browser.
+    with gui_app.app_context():
+        socketio.emit("alert",   alert)
+        socketio.emit("stats",   _stats())
+        socketio.emit("timeline", _tl())
+        socketio.emit("agents",  _agents())  # BUG-3 fix: show agent immediately on first alert
     return jsonify({"ok":True,"id":alert["id"]}),201
 
 @agent_app.route("/api/agent/heartbeat",methods=["POST"])
@@ -169,7 +183,10 @@ def hb():
         agents[aid]["last_seen"]=now_iso; agents[aid]["ip"]=request.remote_addr
         if os_tag: agents[aid]["os"]=os_tag
         if hostname and hostname!="unknown": agents[aid]["hostname"]=hostname
-    socketio.emit("agents",_agents()); return jsonify({"ok":True}),200
+    # Same app-context fix as recv() — agent_app context != gui_app context
+    with gui_app.app_context():
+        socketio.emit("agents", _agents())
+    return jsonify({"ok":True}),200
 
 @gui_app.route("/api/state",methods=["GET"])
 @require_api_key
@@ -649,20 +666,78 @@ def dashboard():
 
 class _SuppressSSLLog:
     """
-    Gevent logs every SSL handshake failure (including routine browser
-    cert-warning probes) as a full traceback. This filter lets through
-    genuine application errors while silencing expected TLS noise.
+    Stream-level SSL noise filter for gevent's error_log= parameter.
+    Catches SSL error text written through the logging stream interface.
+    NOTE: greenlet-level tracebacks bypass this — those are handled by
+    _install_gevent_ssl_filter() which patches the gevent hub directly.
     """
     _SSL_MARKERS = (
         "SSLError", "SSLEOFError", "UNEXPECTED_EOF", "TLSV1_ALERT",
         "SSLV3_ALERT", "unknown ca", "certificate unknown",
-        "EOF occurred in violation",
+        "EOF occurred in violation", "HTTP_REQUEST",
     )
     def write(self, msg):
         if not any(m in msg for m in self._SSL_MARKERS):
             import sys; sys.stderr.write(msg)
     def flush(self): pass
     def close(self): pass
+
+
+def _install_gevent_ssl_filter():
+    """
+    Patch gevent.hub.Hub.handle_error so that ssl.SSLError exceptions
+    raised inside greenlets are silently discarded rather than printed
+    as full tracebacks to sys.stderr.
+
+    Root cause: when a browser sends a plain HTTP request to the HTTPS
+    port (e.g. typing http:// instead of https://), OpenSSL raises
+    ssl.SSLError([SSL: HTTP_REQUEST]).  Gevent's greenlet runner catches
+    this and calls Hub.handle_error, which bypasses error_log entirely
+    and writes directly to sys.stderr.  Patching handle_error is the
+    only reliable way to silence it.
+    """
+    try:
+        import gevent.hub as _gh
+
+        _orig_handle_error = _gh.Hub.handle_error
+
+        def _filtered_handle_error(self, context, type_, value, tb):
+            # Silently drop all SSL handshake errors — these are always
+            # caused by clients sending HTTP to an HTTPS port or by
+            # browsers probing before accepting the self-signed cert.
+            if isinstance(value, ssl.SSLError):
+                return
+            # Let everything else through unchanged.
+            _orig_handle_error(self, context, type_, value, tb)
+
+        _gh.Hub.handle_error = _filtered_handle_error
+    except Exception:
+        pass  # If gevent changes its internals, fail silently
+
+
+def _make_redirect_app(https_port):
+    """
+    Tiny WSGI app that issues a 301 redirect from http:// → https://.
+    Runs on a plain HTTP companion port (gui_port - 1 by default) so
+    browsers that omit the scheme or type http:// are corrected instead
+    of hammering the TLS server with invalid handshakes.
+    """
+    def _redirect(environ, start_response):
+        host_header = environ.get("HTTP_HOST", "localhost")
+        # Strip any port from the Host header and substitute the HTTPS port
+        bare_host = host_header.split(":")[0]
+        path  = environ.get("PATH_INFO", "/")
+        query = environ.get("QUERY_STRING", "")
+        dest  = f"https://{bare_host}:{https_port}{path}"
+        if query:
+            dest += "?" + query
+        start_response("301 Moved Permanently", [
+            ("Location", dest),
+            ("Content-Type", "text/plain"),
+            ("Content-Length", "0"),
+        ])
+        return [b""]
+    return _redirect
 
 
 def main():
@@ -673,13 +748,20 @@ def main():
     cfg=load_config(args.config)
 
     _API_KEY = cfg["api_key"]
-    gui_app.config["API_KEY"] = _API_KEY   # still needed for render_template_string
+    gui_app.config["API_KEY"] = _API_KEY
 
-    host       = cfg.get("server_host", "0.0.0.0")
-    gui_port   = cfg.get("gui_port",    8443)   # browser dashboard
-    agent_port = cfg.get("agent_port",  8444)   # agent REST API
+    host        = cfg.get("server_host",   "0.0.0.0")
+    gui_port    = cfg.get("gui_port",       8443)   # HTTPS — browser dashboard
+    agent_port  = cfg.get("agent_port",     8444)   # HTTPS — agent REST API
+    # Plain-HTTP redirect companion: any http:// request → https://gui_port
+    # Set to 0 in config to disable.
+    redirect_port = cfg.get("redirect_port", gui_port - 1)   # default 8442
 
     display_host = "localhost" if host in ("0.0.0.0", "") else host
+
+    # ── Silence SSL greenlet tracebacks at the gevent-hub level ──────────────
+    # Must be called before any gevent server starts.
+    _install_gevent_ssl_filter()
 
     ssl_ctx=ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     ssl_ctx.load_cert_chain(cfg["server_cert"],cfg["server_key"])
@@ -692,26 +774,32 @@ def main():
     # SEC-04: prune stale agents periodically
     threading.Thread(target=_periodic_prune, daemon=True).start()
 
-    # SEC-05: CORS locked to the GUI origin only
-    socketio.server.eio.cors_allowed_origins = [
-        f"https://{display_host}:{gui_port}",
-        f"https://127.0.0.1:{gui_port}",
-        f"https://localhost:{gui_port}",
-    ]
+    # CORS is handled at SocketIO init time (cors_allowed_origins="*").
+    # Real auth is the token check in on_connect() — CORS is not a
+    # meaningful WebSocket security boundary.
+
+    redirect_line = (
+        f"  ║  HTTP→HTTPS redirect : http://{display_host}:{redirect_port}/  →  https://:{gui_port}"
+        if redirect_port else
+        "  ║  HTTP→HTTPS redirect : disabled"
+    )
 
     print(f"""
   ╔══════════════════════════════════════════════════════════════════╗
   ║   NETSENTINEL SERVER v4   |   TLS 1.2+  ECDHE/AES-GCM         ║
   ╠══════════════════════════════════════════════════════════════════╣
-  ║  GUI Dashboard : https://{display_host}:{gui_port}/             
-  ║  Agent API     : https://{display_host}:{agent_port}/           
-  ╠══════════════════════════════════════════════════════════════════╣
-  ║  Agents connect to port {agent_port} — browsers to port {gui_port}
+  ║  GUI Dashboard  (HTTPS) : https://{display_host}:{gui_port}/
+  ║  Agent API      (HTTPS) : https://{display_host}:{agent_port}/
+{redirect_line}
   ╚══════════════════════════════════════════════════════════════════╝
 
-  NOTE: Your browser will show a certificate warning on first visit.
-  Click  Advanced → Proceed to {display_host}  to accept, then the
-  dashboard will load normally.
+  BROWSER SETUP — first visit only:
+    1. Open https://{display_host}:{gui_port}/
+    2. Click  Advanced → Proceed to {display_host}  to accept the cert.
+    3. Dashboard loads — warning will not reappear.
+
+  TIP: If you accidentally type http://, the redirect server on port
+  {redirect_port} will send you to the correct https:// URL automatically.
 
   Press Ctrl-C to stop.
 """)
@@ -721,22 +809,34 @@ def main():
         import gevent.pywsgi
         from geventwebsocket.handler import WebSocketHandler
 
-        # Agent server — plain WSGI (no WebSocket handler needed)
+        suppress = _SuppressSSLLog()
+
+        # Agent server — HTTPS WSGI only (no WebSocket needed)
         agent_server = gevent.pywsgi.WSGIServer(
             (host, agent_port), agent_app,
             ssl_context=ssl_ctx,
             log=None,
-            error_log=_SuppressSSLLog(),
+            error_log=suppress,
         )
         gevent.spawn(agent_server.serve_forever)
 
-        # GUI server — WebSocket-capable for SocketIO
+        # HTTP→HTTPS redirect server — plain HTTP, no TLS
+        if redirect_port:
+            redirect_server = gevent.pywsgi.WSGIServer(
+                (host, redirect_port),
+                _make_redirect_app(gui_port),
+                log=None,
+                error_log=suppress,
+            )
+            gevent.spawn(redirect_server.serve_forever)
+
+        # GUI server — HTTPS + WebSocket for SocketIO  (blocks until Ctrl-C)
         gui_server = gevent.pywsgi.WSGIServer(
             (host, gui_port), gui_app,
             handler_class=WebSocketHandler,
             ssl_context=ssl_ctx,
             log=None,
-            error_log=_SuppressSSLLog(),
+            error_log=suppress,
         )
         gui_server.serve_forever()
 

@@ -313,6 +313,7 @@ For production, replace the self-signed certs with certs from your internal CA o
   "server_port":           8443,
   "gui_port":              8443,
   "agent_port":            8444,
+  "redirect_port":         8442,
   "api_key":               "<generated>",
   "ca_cert":               "certs/ca.crt",
   "server_cert":           "certs/server.crt",
@@ -336,9 +337,10 @@ For production, replace the self-signed certs with certs from your internal CA o
 
 | Key | Default | Purpose |
 |---|---|---|
-| `server_port` / `gui_port` | `8443` | Browser dashboard + SocketIO WebSocket |
-| `agent_port` | `8444` | Agent REST API (`/api/alert`, `/api/agent/heartbeat`) |
-| `server_host` | `0.0.0.0` | Bind address for both servers |
+| `server_port` / `gui_port` | `8443` | **HTTPS** — browser dashboard + SocketIO WebSocket |
+| `agent_port` | `8444` | **HTTPS** — agent REST API (`/api/alert`, `/api/agent/heartbeat`) |
+| `redirect_port` | `8442` | **HTTP** — plain-HTTP listener that 301-redirects to `https://:<gui_port>`. Set to `0` to disable. |
+| `server_host` | `0.0.0.0` | Bind address for all three servers |
 
 `alert_cooldown` (seconds) — minimum time between repeated alerts for the same source/category pair.
 
@@ -346,8 +348,11 @@ For production, replace the self-signed certs with certs from your internal CA o
 
 ## Troubleshooting
 
+**Browser shows `ssl.SSLError: [SSL: HTTP_REQUEST]` spam in the terminal**
+→ This happens when a browser (or curl) sends a plain `http://` request to the HTTPS port. Two fixes are in place: (1) the gevent hub's error handler is patched to silently discard `ssl.SSLError` at the greenlet level so they never reach stderr; (2) a plain-HTTP redirect server runs on `redirect_port` (default **8442**) and issues a 301 to `https://:<gui_port>` automatically. Always use `https://` when opening the dashboard.
+
 **Browser shows a security certificate warning**
-→ This is expected with self-signed certs. Click through the warning (see Step 3 above). The dashboard works normally after accepting. To eliminate the warning permanently, import `certs/ca.crt` into your OS trust store.
+→ Expected with self-signed certs — this is not the SSL error above. Click through the warning (see Step 3). To eliminate it permanently, import `certs/ca.crt` into your OS trust store.
 
 **Terminal spammed with SSL traceback errors**
 → Fixed in v4.1. The server now filters expected SSL handshake noise (browser probes, health checks, etc.) from the error log. Only genuine application errors are printed.
@@ -355,8 +360,12 @@ For production, replace the self-signed certs with certs from your internal CA o
 **Startup banner shows `{host}:{port}` literally instead of actual values**
 → Fixed in v4.1. Was a Python f-string escaping bug introduced during patching.
 
-**Dashboard tabs load but show no data**
-→ Make sure you accepted the browser cert warning first. The dashboard fetches data over HTTPS using the injected API key — if the cert is rejected, all fetches silently fail.
+**Dashboard shows OFFLINE or tabs load but show no data / agents never appear**
+→ Three root causes were fixed in this release (see bug notes below). If you are running an older copy of the server:
+  1. **WebSocket blocked by CORS** — the server was initialised with `cors_allowed_origins=[]`, which silently rejects every browser Socket.IO connection before authentication. Fixed to `"*"` (auth is the API-key token in `on_connect`, not CORS headers).
+  2. **Live push silently dropped** — `socketio.emit()` was called inside `agent_app`'s request context. Because `socketio` is bound to `gui_app`, Flask-SocketIO 5.x silently no-ops any emit outside the correct app context. Fixed by wrapping all `socketio.emit()` calls with `with gui_app.app_context()`.
+  3. **Agents tab not updated on first alert** — `recv()` emitted `alert/stats/timeline` but not `agents`, so a freshly connected agent was invisible until its next heartbeat (30 s). Fixed by adding `socketio.emit("agents", _agents())` to `recv()`.
+→ Also make sure you accepted the browser cert warning first. The dashboard fetches initial state over HTTPS — if the cert is rejected, `fetchState()` silently fails.
 
 **Agent says "No interfaces found" on Windows**
 → Install Npcap from https://npcap.com and reboot.
